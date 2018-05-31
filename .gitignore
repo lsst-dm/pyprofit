@@ -2,7 +2,8 @@ dist
 build
 *.so
 *.egg-info
-.idea
+.idea/*
+!.idea/runConfigurations
 .project
 .pydevproject
 tmp

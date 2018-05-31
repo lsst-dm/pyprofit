@@ -1,0 +1,21 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="pyprofit-bench-integ-long" type="PythonConfigurationType" factoryName="Python">
+    <module name="pyprofit" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/examples" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/examples/benchmark_profile_evaluation.py" />
+    <option name="PARAMETERS" value="-g 1 -gfft 1 -n 5 -N 0.5,6,23 -a 0,45,10 -A 0.1,1,10 -r 0.5,10,20 -b 0 -w 100 -H 100 -psf 3.5 -s 3 -p $USER_HOME$/raid/lsst/fit_bench_" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="false" />
+    <option name="MODULE_MODE" value="false" />
+    <method />
+  </configuration>
+</component>
