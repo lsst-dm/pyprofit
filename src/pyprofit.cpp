@@ -28,11 +28,21 @@
 
 #include <map>
 #include <memory>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#ifndef PROFIT_PROFIT_H
 #include "profit/profit.h"
+#endif
+
+#ifndef __PYPROFIT_GAUSS_H_
+#include "gauss.h"
+#endif
+#ifndef __PYPROFIT_PYPROFIT_H_
+#include "pyprofit.h"
+#endif
 
 using namespace profit;
 
@@ -44,17 +54,6 @@ using namespace profit;
 #else
 	#define STRING_FROM_UTF8(val, len) PyString_FromStringAndSize((const char *)val, len)
 #endif
-
-/* Exceptions */
-static PyObject *profit_error;
-
-/* Macros */
-#define PYPROFIT_RAISE(str) \
-	do { \
-		PyErr_SetString(profit_error, str); \
-		return NULL; \
-	} while (0)
-
 
 /* OpenCL-related methods/object */
 static PyObject *pyprofit_opencl_info(PyObject *self, PyObject *args) {
@@ -324,7 +323,7 @@ void _read_profiles(Model &model, PyObject *profiles_dict, const char *name, voi
 			auto p = model.add_profile(name);
 			read_bool(p, item, "convolve");
 			item_to_profile(p, item);
-		} catch(invalid_parameter &e) {
+		} catch(`alid_parameter &e) {
 			std::ostringstream os;
 			os << "warning: failed to create profile " << name << ": " << e.what();
 			PySys_WriteStderr("%s\n", os.str().c_str());
@@ -542,6 +541,93 @@ static PyObject *pyprofit_make_convolver(PyObject *self, PyObject *args, PyObjec
 	return convolver_ptr;
 }
 
+static PyObject * pyprofit_make_gaussian(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+
+	static const char *kwlist[] = {
+	    "xcen", "ycen", "mag", "re", "ang", "axrat", "xmin", "xmax", "ymin", "ymax",
+	    "xdim", "ydim", "acc", NULL
+	};
+
+    static const std::vector<std::string> PARAMS_DOUBLE{
+        "xcen", "ycen", "mag", "re", "ang", "axrat", "xmin", "xmax", "ymin", "ymax", "acc"
+    };
+    static const std::vector<std::string> PARAMS_UINT{
+        "xdim", "ydim"
+    };
+
+    std::vector<double> paramvals_d(PARAMS_DOUBLE.size());
+    std::vector<unsigned int> paramvals_i(PARAMS_UINT.size());
+
+    static const char * fmt = "ddddddddddIId:make_gaussian";
+
+    int res = PyArg_ParseTupleAndKeywords(
+        args, kwargs, fmt, const_cast<char **>(kwlist),
+        &paramvals_d[0], &paramvals_d[1], &paramvals_d[2], &paramvals_d[3], &paramvals_d[4],
+        &paramvals_d[5], &paramvals_d[6], &paramvals_d[7], &paramvals_d[8], &paramvals_d[9],
+        &paramvals_i[0], &paramvals_i[1], &paramvals_d[10]
+    );
+
+    std::string errmsg = "";
+    for(size_t i = 0; i < PARAMS_DOUBLE.size(); ++i)
+    {
+        const std::string PARAM = PARAMS_DOUBLE[i];
+        const double VAL = paramvals_d[i];
+        if(!std::isfinite(VAL))
+        {
+            errmsg += "[Param " + PARAM + " not finite.]";
+        }
+        if((PARAM == "re" || PARAM == "axrat" || PARAM == "acc") && !(VAL > 0))
+        {
+            errmsg += "[Param " + PARAM + "=" + std::to_string(VAL) + " !>0.]";
+        }
+        if(PARAM == "axrat" && !(VAL <= 1))
+        {
+            errmsg += "[Param " + PARAM + "=" + std::to_string(VAL) + " !<=0.]";
+        }
+        //std::cerr << PARAM << "=" << VAL;
+    }
+    for(size_t i = 0; i < PARAMS_UINT.size(); ++i)
+    {
+        const std::string PARAM = PARAMS_UINT[i];
+        const unsigned int VAL = paramvals_i[i];
+        if(!std::isfinite(VAL))
+        {
+            errmsg += "[Param " + PARAM + " not finite.]";
+        }
+        if((PARAM == "xdim" || PARAM == "ydim") && !(VAL > 0))
+        {
+            errmsg += "[Param " + PARAM + "=" + std::to_string(VAL) + " !>0.]";
+        }
+        //std::cerr << PARAM << "=" << VAL;
+    }
+    if(!errmsg.empty()) throw std::domain_error("Errors in parameters: " + errmsg);
+
+    Image mat = profit_make_gaussian(
+        paramvals_d[0], paramvals_d[1], paramvals_d[2], paramvals_d[3], paramvals_d[4],
+        paramvals_d[5], paramvals_d[6], paramvals_d[7], paramvals_d[8], paramvals_d[9],
+        paramvals_i[0], paramvals_i[1], paramvals_d[10]
+    );
+
+    auto im_dims = mat.getDimensions();
+    PyObject *image_tuple = PyTuple_New(im_dims.y);
+    /* Copy resulting image into a 2-D tuple */
+    for(size_t i=0; i!=im_dims.y; i++)
+    {
+        PyObject *row_tuple = PyTuple_New(im_dims.x);
+        if( row_tuple == NULL )
+        {
+            PYPROFIT_RAISE("Couldn't create row tuple");
+        }
+        for(size_t j=0; j!=im_dims.x; j++) {
+            PyObject *val = PyFloat_FromDouble(mat[i*im_dims.x + j]);
+            PyTuple_SetItem(row_tuple, j, val);
+        }
+        PyTuple_SetItem(image_tuple, i, row_tuple);
+    }
+    return(image_tuple);
+}
+
 static PyObject *pyprofit_make_model(PyObject *self, PyObject *args) {
 
 	unsigned int i, j, psf_width = 0, psf_height = 0;
@@ -706,6 +792,7 @@ static PyObject *pyprofit_make_model(PyObject *self, PyObject *args) {
  * Methods in the pyprofit module
  */
 static PyMethodDef pyprofit_methods[] = {
+    {"make_gaussian",  (PyCFunction)pyprofit_make_gaussian, METH_VARARGS | METH_KEYWORDS, "Integrates a Gaussian over a rectangular grid."},
     {"make_model",     pyprofit_make_model,     METH_VARARGS, "Creates a profit model."},
     {"make_convolver", (PyCFunction)pyprofit_make_convolver, METH_VARARGS | METH_KEYWORDS, "Creates a reusable convolver."},
     {"opencl_info",    pyprofit_opencl_info,    METH_NOARGS,  "Gets OpenCL environment information."},
@@ -717,12 +804,12 @@ static PyMethodDef pyprofit_methods[] = {
 /* Support for Python 2/3 */
 #if PY_MAJOR_VERSION >= 3
 static struct PyModuleDef moduledef = {PyModuleDef_HEAD_INIT, "pyprofit", "libprofit wrapper for python", -1, pyprofit_methods};
-	#define MOD_INIT(name) PyMODINIT_FUNC PyInit_##name(void)
+	#define MOD_INIT(name) PyMODINIT_FUNC PyInit__##name(void)
 	#define MOD_DEF(m, name, doc, methods) \
 		m = PyModule_Create(&moduledef);
 	#define MOD_VAL(v) v
 #else
-	#define MOD_INIT(name) PyMODINIT_FUNC init##name(void)
+	#define MOD_INIT(name) PyMODINIT_FUNC init_##name(void)
 	#define MOD_DEF(m, name, doc, methods) \
 		m = Py_InitModule3(name, methods, doc);
 	#define MOD_VAL(v)
