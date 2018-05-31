@@ -2,6 +2,7 @@ dist
 build
 *.so
 *.egg-info
+.idea
 .project
 .pydevproject
 tmp

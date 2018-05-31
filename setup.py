@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_packages
 import setuptools
 from setuptools.command.build_ext import build_ext
 
@@ -41,6 +41,7 @@ from setuptools.command.build_ext import build_ext
 #
 libprofit_versions = (
     (1, 7, 0, None),
+    (1, 7, 1, None),
 )
 
 class mute_compiler(object):
@@ -311,7 +312,7 @@ class _build_ext(build_ext):
 
 # The initial definition of the pyprofit module
 # It is enriched during the 'configure' step
-pyprofit_ext = Extension('pyprofit', language='c++', sources = ['pyprofit.cpp'])
+pyprofit_ext = Extension('_pyprofit', language='c++', sources = glob.glob("src/*.cpp"))
 
 setup(
       name='pyprofit',
@@ -332,6 +333,7 @@ setup(
           "Programming Language :: Python :: 3.6",
           "Topic :: Scientific/Engineering :: Astronomy"
       ],
+      packages = find_packages(),
       ext_modules = [pyprofit_ext],
       cmdclass = {
         'configure': configure,
