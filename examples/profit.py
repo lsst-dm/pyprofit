@@ -73,12 +73,12 @@ def profit_test_gama(basename='G265911', **kwargs):
     params = {
         "init": [np.array([120,    120,    15.6, 45.0, 0.60, 130, 0.5, 0]),
                  np.array([np.nan, np.nan, 18.0, 15.0, 1.15, 120, 0.7, 0])]
-        ,"tofit": [np.array([True, True, True, True, True, True, True, False]),
-                   np.array([False, False, True, False, True, True, True, False])]
-        ,"tolog":  [np.array([False, False, False, True, True, False, True, False])]
-        ,"sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])]
-        ,"lowers": [np.array([0., 0, 10, 0, -1, -180, -1, -1])]
-        ,"uppers": [np.array([1e3, 1e3, 30, 2, 1, 360, -1e-3, 1])]
+        , "tofit": [np.array([True, True, True, True, True, True, True, False]),
+                    np.array([False, False, True, False, True, True, True, False])]
+        , "tolog":  [np.array([False, False, False, True, True, False, True, False])]
+        , "sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])]
+        , "lowers": [np.array([0., 0, 10, 0, -1, -180, -1, -1])]
+        , "uppers": [np.array([1e3, 1e3, 30, 2, 1, 360, -1e-3, 1])]
     }
 
     nprofiles = len(params["init"])
