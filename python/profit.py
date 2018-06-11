@@ -23,11 +23,13 @@
 This module defines functions for fitting profiles to sources.
 """
 
+import copy
 import galsim
 import itertools
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pyprofit
+import time
 
 import numpy as np
 import pygmo as pg
@@ -87,26 +89,80 @@ def rebuild_profiles(values, model, usenames=None, haspsf=None):
     return rebuilt
 
 
+def nan_inherit(params, tocheck=None):
+    check = tocheck is not None
+    nans = np.where(np.isnan(params))
+    for nani in nans[0]:
+        if nani == 0 or (check and tocheck[nani]):
+            raise ValueError("Something went horribly wrong and param[" + str(nani) +
+                             "] is nan despite being zero or in tocheck=" + str(tocheck))
+        params[nani] = params[nani - 1]
+    return params
+
+
+def data_rebuild_profiles(params, data, applyconstraints=None):
+    if applyconstraints is None:
+        applyconstraints = True
+    # merge, un-sigma all, un-log some
+    allparams = data.initalllinear.copy()
+
+    allparams[data.tofit] = params*data.sigmas[data.tofit]
+    allparams[data.tolog] = 10**allparams[data.tolog]
+    nan_inherit(allparams, data.tofit)
+
+    haspsf = data.psf is not None
+    profiles = rebuild_profiles(allparams, data.modelparamdict, True, haspsf)
+    if applyconstraints and data.constraints is not None:
+        profiles = data.constraints(profiles)
+
+    return profiles, allparams, haspsf
+
+
 def get_dict_model(idict):
     return {key: len(value) for key, value in idict.items()}
 
 
-def make_model_galsim(model, psf, nx, ny):
+# Input should be a dict of params with ProFit names
+def profile_is_gaussian(profile, profilename):
+    isgaussian = profilename == "gaussian" or \
+                 (profilename == "sersic" and profile["nser"] == 0.5) or \
+                 (profilename == "moffat" and np.isinf(profile["con"]))
+    return isgaussian
+
+
+def make_model_galsim(model, psf, nx=None, ny=None):
     profilesgs = {
         "convolve": None
-        ,"deconvolved": None
+        , "deconvolved": None
     }
-    cenximg = nx/2
-    cenyimg = ny/2
+    cenximg = nx
+    cenyimg = ny
+    cenxisnone = nx is None
+    cenyisnone = ny is None
+    if not cenxisnone:
+        cenximg /= 2
+    if not cenyisnone:
+        cenyimg /= 2
+    shiftxy = not cenxisnone and not cenyisnone
     for profilename, profiles in model.items():
         for profile in profiles:
-            cenx = profile["xcen"]
-            ceny = profile["ycen"]
             flux = 10**(-0.4*profile["mag"])
             axrat = profile["axrat"]
-            if profilename == "sersic":
+
+            isgaussian = profile_is_gaussian(profile, profilename)
+            if isgaussian:
+                if profilename == "sersic":
+                    fwhm = profile["re"]
+                else:
+                    fwhm = profile["fwhm"]
+                profilegs = galsim.Gaussian(
+                    fwhm=fwhm*np.sqrt(axrat)
+                    , flux=flux
+                    , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
+                )
+            elif profilename == "sersic":
                 profilegs = galsim.Sersic(
-                    n = profile["nser"]
+                    n=profile["nser"]
                     , half_light_radius=profile["re"]*np.sqrt(axrat)
                     , flux=flux
                     , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
@@ -118,17 +174,12 @@ def make_model_galsim(model, psf, nx, ny):
                     , flux=flux
                     , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
                 )
-            elif profilename == "gaussian":
-                profilegs = galsim.Gaussian(
-                    fwhm=profile["fwhm"] * np.sqrt(axrat)
-                    , flux=flux
-                    , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
-                )
             else:
                 raise ValueError("Unknown galsim profile type [{:s}]".format(profilename))
 
             profilegs = profilegs.shear(g=(1 - axrat) / (1 + axrat), beta=(profile["ang"]+90)*galsim.degrees)
-            profilegs = profilegs.shift(dx=cenx-cenximg, dy=ceny-cenyimg)
+            if shiftxy:
+                profilegs = profilegs.shift(dx=profile["xcen"]-cenximg, dy=profile["ycen"]-cenyimg)
 
             if "convolve" in profile and profile["convolve"]:
                 profilestype = "convolve"
@@ -140,41 +191,33 @@ def make_model_galsim(model, psf, nx, ny):
             else:
                 profilesgs[profilestype] += profilegs
 
-    image = galsim.ImageD(nx, ny, xmin=0, ymin=0, scale=1)
     if profilesgs["convolve"] is None:
         profilesgs["convolve"] = profilesgs["deconvolved"]
     else:
-        psfgs = galsim.InterpolatedImage(galsim.ImageD(psf, scale=1))
+        if isinstance(psf, galsim.GSObject):
+            psfgs = psf
+        else:
+            psfgs = galsim.InterpolatedImage(galsim.ImageD(psf, scale=1))
         profilesgs["convolve"] = galsim.Convolve(profilesgs["convolve"], psfgs)
         if profilesgs["deconvolved"] is not None:
             profilesgs["convolve"] += profilesgs["deconvolved"]
 
-    scene = profilesgs["convolve"].drawImage(image, method="fft").array
-    return scene.copy()
+    return profilesgs["convolve"]
 
 
-def make_image(params, data, use_mask=True):
+def make_model_image_galsim(model, image, method=None):
+    if method is None:
+        method = "auto"
+    scene = model.drawImage(image, method=method).array
+    # I'm not sure why this seems to be necessary but it's either overzealous garbage collection or PEBKAC
+    return scene
 
-    # merge, un-sigma all, un-log some
-    allparams = data.initalllinear.copy()
 
-    allparams[data.tofit] = params*data.sigmas[data.tofit]
-    allparams[data.tolog] = 10**allparams[data.tolog]
-    nans = np.where(np.isnan(allparams))
-    for nani in nans[0]:
-        if nani == 0 or data.tofit[nani]:
-            raise ValueError("Something went horribly wrong and param[" + str(nani) +
-                             "] is nan despite being zero or being fit.")
-        allparams[nani] = allparams[nani-1]
-
-    haspsf = data.psf is not None
-    profiles = rebuild_profiles(allparams, data.modelparamdict, True, haspsf)
-
+def make_image_from_profiles(profiles, allparams, haspsf, data, use_calcinvmask=None):
+    if use_calcinvmask is None:
+        use_calcinvmask = False
     if data.verbose:
         print(zip(data.names, allparams))
-
-    if data.constraints is not None:
-        profiles = data.constraints(profiles)
 
     profit_model = {
         'width':  data.image.shape[1],
@@ -185,24 +228,46 @@ def make_image(params, data, use_mask=True):
     if haspsf:
         profit_model["psf"] = data.psf
 
-    if use_mask:
-        profit_model['calcmask'] = data.calcregion
+    if use_calcinvmask:
+        profit_model['calcmask'] = data.calcinvmask
     if data.engine == "libprofit":
         model = np.array(pyprofit.make_model(profit_model)[0])
     else:
-        model = make_model_galsim(profit_model["profiles"], data.psf, data.image.shape[0], data.image.shape[1])
+        # TODO: Change this to the model image size
+        model = make_model_galsim(
+            profit_model["profiles"], data.psf, data.image.shape[0], data.image.shape[1])
+        model = make_model_image_galsim(model, data.modelimage, method=data.method)
     return allparams, model
+
+
+def make_image(params, data, use_calcinvmask=None):
+    if use_calcinvmask is None:
+        use_calcinvmask = False
+
+    profiles, allparams, haspsf = data_rebuild_profiles(params, data)
+    return make_image_from_profiles(profiles, allparams, haspsf, data, use_calcinvmask)
 
 
 def like_model(params, data):
 
-    # Get the priors sum
-    priorsum = 0
-    for i, p in enumerate(data.priors[data.tofit]):
-        priorsum += p(data.init[i] - params[i])
+    # Rebuild profiles - we may need allparams for the prior sum
+    profiles, allparams, haspsf = data_rebuild_profiles(params, data)
 
+    # TODO: Is this working correctly? Params are already scaled by sigma, but so is prior_func...
+    # Get the log prior sum
+    priorsum = 0
+    priors = data.priors
+    if data.use_allpriors:
+        priordiff = data.initalllinearnonans - allparams
+    else:
+        priordiff = data.initalllinearnonans[data.tofit] - allparams[data.tofit]
+        priors = priors[data.tofit]
+    for i, p in enumerate(priors):
+        priorsum += p(priordiff[i])
+
+    # TODO: Don't even bother if prior sum isn't finite (LP=-Inf is zero prior probability)
     # Calculate the new model
-    allparams, modelim = make_image(params, data)
+    allparams, modelim = make_image_from_profiles(profiles, allparams, haspsf, data, data.use_calcinvmask)
 
     # Scale and stuff
     scaledata = (data.image[data.region] - modelim[data.region])*data.invsigim[data.region]
@@ -291,46 +356,71 @@ def unscale_params(params, tolog, sigmas):
 def setup_data(
     magzero, image, invmask, invsigim, psf,
     names, init, tofit, tolog, sigmas, priors, lowers, uppers,
-    engine=None, constraints=None):
+    engine=None, constraints=None, use_calcinvmask=None, use_allpriors=None,
+    method=None):
 
     if engine is None:
         engine = "libprofit"
 
+    if use_calcinvmask is None:
+        use_calcinvmask = False
+
+    if use_allpriors is None:
+        use_allpriors = False
+
+    if method is None:
+        method = "real_space"
 #    im_w, im_h = image.shape
 #    psf_w, psf_h = psf.shape
 
-    invmask = invmask == 1
-
-    # Use the PSF to calculate 'calcregion', which is where we
-    # effectively calculate the sersic profile
-    if psf is not None:
-        psf[psf<0] = 0
-        sumpsf = np.sum(psf)
-        if sumpsf != 1:
-            psf /= sumpsf
-        calcregion = signal.convolve2d(invmask, psf+1, mode='same')
-        calcregion = calcregion > 0
-    else:
-        calcregion = invmask
-
     data = Data()
+    data.region = invmask == 1
+
+    # Use the PSF to calculate 'calcinvmask', which is a mask
+    # of pixels where we actually need to compute the model
+    if psf is not None:
+        method = "fft"
+        if isinstance(psf, galsim.GSObject):
+            # TODO: Think about whether we should allow finite support for GSObject PSFs
+            data.calcinvmask = None
+            data.use_calcinvmask = False
+        else:
+            imgpsf = psf
+            imgpsf[imgpsf < 0] = 0
+            sumpsf = np.sum(psf)
+            if sumpsf != 1:
+                psf /= sumpsf
+            data.calcinvmask = signal.convolve2d(data.region, psf+1, mode='same')
+            data.calcinvmask = data.calcinvmask > 0
+    else:
+        # Don't need to calculate the model in masked pixels without a psf
+        data.calcinvmask = data.region
+
+    data.use_calcinvmask = use_calcinvmask
+    data.use_allpriors = use_allpriors
     data.engine = engine
+    if data.engine == "galsim":
+        data.modelimage = galsim.ImageD(image.shape[0], image.shape[1], xmin=0, ymin=0, scale=1)
+    else:
+        # TODO: Have a cached image for libprofit too instead of re-allocating
+        pass
+    data.method = method
     data.constraints = constraints
     data.magzero = magzero
     data.image = image
     data.invsigim = invsigim
     data.psf = psf
-    data.region = invmask
-    data.calcregion = calcregion
     data.verbose = False
     data.modelparamdict = get_dict_model(tofit)
     data.names = collapse_profiles(names)
-    data.initalllinear = collapse_profiles(init)
     data.priors = collapse_profiles(priors)
     data.tolog = collapse_profiles(tolog)
     data.tofit = collapse_profiles(tofit)
     data.tolog = np.logical_and(data.tolog, data.tofit)
     data.sigmas = collapse_profiles(sigmas)
+    data.initalllinear = collapse_profiles(init)
+    # TODO: Less stupidly long names
+    data.initalllinearnonans = nan_inherit(copy.copy(data.initalllinear))
 
     # copy initial parameters
     # log some, /sigma all, filter
@@ -355,18 +445,18 @@ def plot_image_comparison(fitsim, modelim, invsigmaim, region):
     ylist = np.arange(0, fitsim.shape[0])
     X, Y = np.meshgrid(xlist, ylist)
     Z = region
-    fitsplot = fig.add_subplot(141)
+    fitsplot = fig.add_subplot(221)
     fitsplot.imshow(fitsim, cmap='gray', norm=mpl.colors.LogNorm())
     fitsplot.contour(X, Y, Z)
-    modplot = fig.add_subplot(142)
+    modplot = fig.add_subplot(222)
     modplot.imshow(modelim, cmap='gray', norm=mpl.colors.LogNorm())
     modplot.contour(X, Y, Z)
-    diffplot = fig.add_subplot(143)
+    diffplot = fig.add_subplot(223)
     diffplot.imshow(fitsim - modelim, cmap='gray', norm=mpl.colors.LogNorm())
     diffplot.contour(X, Y, Z)
-    histplot = fig.add_subplot(144)
+    histplot = fig.add_subplot(224)
     diff = (fitsim[region] - modelim[region])*invsigmaim[region]
-    histplot.hist(diff[~np.isnan(diff)], bins=100)
+    histplot.hist(diff[~np.isnan(diff)], bins=100, log=True)
 
 
 def prior_func(s):
@@ -375,15 +465,22 @@ def prior_func(s):
     return norm_with_fixed_sigma
 
 
-def fit(data, optlib="scipy", algo="L-BFGS-B", grad=True):
-    print(data.init)
-    print(like_model(data.init, data))
+def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printfinal=None):
+    if printfinal is None:
+        printfinal = True
+    if init is None:
+        init = data.init
+
+    print(init)
+    print(like_model(init, data))
 
     if optlib == "scipy":
         def neg_like_model(params, pdata):
             return -like_model(params, pdata)
 
-        result = optimize.minimize(neg_like_model, data.init, args=(data,), method=algo, bounds=data.bounds, options={'disp':True})
+        tinit = time.time()
+        result = optimize.minimize(neg_like_model, init, args=(data,), method=algo, bounds=data.bounds,
+                                   options={'disp':True})
         paramsbest = result.x
 
     elif optlib == "pygmo":
@@ -432,15 +529,83 @@ def fit(data, optlib="scipy", algo="L-BFGS-B", grad=True):
             npushed = 0
             while npushed < npop:
                 try:
-                    pop.push_back(data.init + np.random.normal(np.zeros(np.sum(data.tofit)), data.sigmas[data.tofit]))
+                    pop.push_back(init + np.random.normal(np.zeros(np.sum(data.tofit)),
+                                  data.sigmas[data.tofit]))
                     npushed += 1
                 except:
                     pass
         else:
-            pop.push_back(data.init)
+            pop.push_back(init)
+        tinit = time.time()
         result = algo.evolve(pop)
         paramsbest = result.champion_x
     else:
         raise ValueError("Unknown optimization library " + optlib)
 
-    return paramsbest
+    timerun = time.time() - tinit
+
+    if printfinal:
+        print("Elapsed time: {:.1f}".format(timerun))
+        print("Final likelihood: {:.2f}".format(like_model(paramsbest, data)))
+        print("Parameter names: " + ",".join(["{:10s}".format(i) for i in data.names[data.tofit]]))
+        print("Scaled parameters: " + ",".join(["{:.4e}".format(i) for i in paramsbest]))
+        # TODO: These should be methods in the data object
+        paramstransformed = paramsbest * data.sigmas[data.tofit]
+        print("Parameters (logged): " + ",".join(["{:.4e}".format(i) for i in paramstransformed]))
+        paramslinear = copy.copy(paramstransformed)
+        paramslinear[data.tolog[data.tofit]] = 10 ** paramslinear[data.tolog[data.tofit]]
+        print("Parameters (unlogged): " + ",".join(["{:.4e}".format(i) for i in paramslinear]))
+
+    return paramsbest, paramstransformed, paramslinear, timerun, data
+
+
+# Params: a dict by profile type
+def fit_image(image, invmask, inverr, psf, params, plotinit=None, printfinal=None,
+              engine=None, constraints=None, use_allpriors=None, method=None, **kwargs):
+    if plotinit is None:
+        plotinit = False
+    if printfinal is None:
+        printfinal = True
+    if method is None:
+        method = "auto"
+
+    # A dict split by param type (init, sigma, etc.) and then by profile type
+    paramssplit = {}
+    for profilename, profileinfo in params.items():
+        nprofiles = len(profileinfo["init"])
+
+        # Store the number of params per profile type
+        # In retrospect, this could/should be the number of profiles instead. Oh well.
+        profiles = [{} for _ in range(nprofiles)]
+        for key, value in profileinfo.items():
+            # If this is true, each profile of this type has its own values; otherwise copy [0]
+            valueperprofile = len(value) > 1
+            for i, profile in enumerate(profiles):
+                profile[key] = copy.copy(value[i*valueperprofile])
+
+        # Convert the profile list to a parameter array
+        profileparams = profiles_to_params(profiles, profilename)
+        for key, value in profileparams.items():
+            if key not in paramssplit:
+                paramssplit[key] = {}
+            paramssplit[key][profilename] = value
+
+    # Set up the initial structure that will hold all the data needed afterwards
+    data = setup_data(
+        0, image, invmask, inverr, psf, **paramssplit,
+        engine=engine, constraints=constraints, use_allpriors=use_allpriors, method=method
+    )
+
+    lpinit = like_model(data.init, data)
+    if not np.isfinite(lpinit):
+        raise ValueError("Non-finite initial LP")
+    _, modelim0 = make_image(data.init, data, data.use_calcinvmask)
+
+    if plotinit:
+        plot_image_comparison(data.image, modelim0, data.invsigim, data.region)
+        plt.show()
+
+    # Go, go, go!
+    data.verbose = False
+    return fit_data(data, printfinal=printfinal, **kwargs)
+
