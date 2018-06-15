@@ -14,6 +14,10 @@ from skimage import measure
 import subprocess
 from subprocess import PIPE
 
+algo_default = "lbfgs (pygmo), L-BFGS-B (scipy)"
+algos_lib_default = {"scipy": "L-BFGS-B", "pygmo": "lbfgs"}
+optlibs = ["pygmo", "scipy"]
+
 # Shamelessly stolen from astrometry.net
 # Returns (rtn, out, err)
 def run_command(cmd, timeout=None, callback=None, stdindata=None,
@@ -269,10 +273,10 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmodeluse=False,
-            algo=None, galsim=False, useobj=False):
+def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmodeluse=False, optlib="scipy",
+            algo=None, grad=False, galsim=False, useobj=False):
     if algo is None:
-        algo = "L-BFGS-B"
+        algo = algos_lib_default[optlib]
 
     engine = None
     if galsim:
@@ -364,7 +368,7 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
             paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
                 psf, psf*0+1, psf*0+np.prod(psf.shape), None, params, plotinit=True,
                 engine=engine, constraints=constraints, use_allpriors=True, method="fft",
-                algo=algo
+                optlib=optlib, algo=algo, grad=grad
             )
 
             if not isgaussian:
@@ -391,14 +395,14 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
                 paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
                     psf, psf*0+1, psf*0+np.prod(psf.shape), None, params, plotinit=False,
                     engine=engine, constraints=constraints, use_allpriors=True, method="fft",
-                    algo=algo
+                    optlib=optlib, algo=algo, grad=grad
                 )
 
             verifyreal = False
             if verifyreal:
                 data.method = "real_space"
                 paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_data(
-                    data, init=paramsbest, algo=algo
+                    data, init=paramsbest, optlib=optlib, algo=algo, grad=grad,
                 )
 
             if psfmodeluse:
@@ -430,7 +434,7 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
         paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
             image["data"], image["invmask"], image["inverr"], psf, params, engine=engine,
             use_allpriors=True, method="fft", plotinit=True,
-            algo=algo
+            optlib=optlib, algo=algo, grad=grad
         )
 
         all_params, modelim  = pro.make_image(paramsbest, data, use_calcinvmask=False)
@@ -459,7 +463,9 @@ if __name__ == '__main__':
             {"type": str, "default": "gaussian:1", "desc":
                 "PSF model description as comma-separated list of [profile]:[number];"
                 "only one profile type currently supported"}
+        , "optlib":    {"type": str,  "default": "scipy", "desc": "Optimization library", "values": optlibs}
         , "algo":      {"type": str,  "default": None, "desc": "Optimization algorithm"}
+        , "grad":      {"type": str2bool, "default": False, "desc": "Use numerical gradient (pygmo)"}
         , "galsim":    {"type": str2bool, "default": False, "desc": "Use galsim for modeling"}
     }
 

@@ -32,6 +32,7 @@ import pyprofit
 import time
 
 import numpy as np
+import pygmo as pg
 from scipy import optimize
 from scipy import signal
 from scipy import stats
@@ -464,7 +465,7 @@ def prior_func(s):
     return norm_with_fixed_sigma
 
 
-def fit_data(data, init=None, algo="L-BFGS-B", printfinal=None):
+def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printfinal=None):
     if printfinal is None:
         printfinal = True
     if init is None:
@@ -473,13 +474,73 @@ def fit_data(data, init=None, algo="L-BFGS-B", printfinal=None):
     print(init)
     print(like_model(init, data))
 
-    def neg_like_model(params, pdata):
-        return -like_model(params, pdata)
+    if optlib == "scipy":
+        def neg_like_model(params, pdata):
+            return -like_model(params, pdata)
 
-    tinit = time.time()
-    result = optimize.minimize(neg_like_model, init, args=(data,), method=algo, bounds=data.bounds,
-                               options={'disp':True})
-    paramsbest = result.x
+        tinit = time.time()
+        result = optimize.minimize(neg_like_model, init, args=(data,), method=algo, bounds=data.bounds,
+                                   options={'disp':True})
+        paramsbest = result.x
+
+    elif optlib == "pygmo":
+
+        boundslower = [data.bounds[i][0] for i in range(len(data.bounds))]
+        boundsupper = [data.bounds[i][1] for i in range(len(data.bounds))]
+
+        class profit_udp:
+            def fitness(self, x):
+                return [-like_model(x, data=data)]
+
+            def get_bounds(self):
+                return boundslower, boundsupper
+
+        class profit_udp_grad:
+            def fitness(self, x):
+                return [-like_model(x, data=data)]
+
+            def get_bounds(self):
+                return boundslower, boundsupper
+
+            def gradient(self, x):
+                return pg.estimate_gradient(lambda x: self.fitness(x), x)
+
+        algocmaes = algo == "cmaes"
+        algonlopt = not algocmaes
+        if algocmaes:
+            uda = pg.cmaes()
+        elif algonlopt:
+            uda = pg.nlopt(algo)
+
+        algo = pg.algorithm(uda)
+#        algo.extract(pg.nlopt).ftol_rel = 1e-6
+        if algonlopt:
+            algo.extract(pg.nlopt).ftol_abs = 1e-3
+
+        algo.set_verbosity(1)
+
+        if grad:
+            prob = pg.problem(profit_udp_grad())
+        else:
+            prob = pg.problem(profit_udp())
+        pop = pg.population(prob=prob, size=0)
+        if algocmaes:
+            npop = 5
+            npushed = 0
+            while npushed < npop:
+                try:
+                    pop.push_back(init + np.random.normal(np.zeros(np.sum(data.tofit)),
+                                  data.sigmas[data.tofit]))
+                    npushed += 1
+                except:
+                    pass
+        else:
+            pop.push_back(init)
+        tinit = time.time()
+        result = algo.evolve(pop)
+        paramsbest = result.champion_x
+    else:
+        raise ValueError("Unknown optimization library " + optlib)
 
     timerun = time.time() - tinit
 
