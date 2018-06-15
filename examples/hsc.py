@@ -277,6 +277,10 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
     if algo is None:
         algo = algos_lib_default[optlib]
 
+    engine = None
+    if galsim:
+        engine = "galsim"
+
     image, psf = gethsc(
         [band], radec[0], radec[1], semiwidth=size, semiheight=size,
         prefix='-'.join(radec)
@@ -403,8 +407,12 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
                     data, init=paramsbest, optlib=optlib, algo=algo, grad=grad,
                 )
 
-            if psfmodeluse:
-                psfparams, psf = pro.make_image(paramsbest, data, False)
+                if psfmodeluse:
+                    if engine == "galsim":
+                        profiles, _, _ = pro.data_rebuild_profiles(paramsbest, data)
+                        psf = pro.make_model_galsim(profiles, None, None, None)
+                    else:
+                        psfparams, psf = pro.make_image(paramsbest, data, False)
 
         nxy = image["data"].shape
         cenx, ceny = [x/2.0 for x in nxy]
@@ -426,7 +434,7 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
         }
 
         paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
-            image["data"], image["invmask"], image["inverr"], psf, params,
+            image["data"], image["invmask"], image["inverr"], psf, params, engine=engine,
             use_allpriors=True, method="fft", plotinit=True,
             optlib=optlib, algo=algo, grad=grad
         )

@@ -24,6 +24,7 @@ This module defines functions for fitting profiles to sources.
 """
 
 import copy
+import galsim
 import itertools
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -129,6 +130,89 @@ def profile_is_gaussian(profile, profilename):
     return isgaussian
 
 
+def make_model_galsim(model, psf, nx=None, ny=None):
+    profilesgs = {
+        "convolve": None
+        , "deconvolved": None
+    }
+    cenximg = nx
+    cenyimg = ny
+    cenxisnone = nx is None
+    cenyisnone = ny is None
+    if not cenxisnone:
+        cenximg /= 2
+    if not cenyisnone:
+        cenyimg /= 2
+    shiftxy = not cenxisnone and not cenyisnone
+    for profilename, profiles in model.items():
+        for profile in profiles:
+            flux = 10**(-0.4*profile["mag"])
+            axrat = profile["axrat"]
+
+            isgaussian = profile_is_gaussian(profile, profilename)
+            if isgaussian:
+                if profilename == "sersic":
+                    fwhm = profile["re"]
+                else:
+                    fwhm = profile["fwhm"]
+                profilegs = galsim.Gaussian(
+                    fwhm=fwhm*np.sqrt(axrat)
+                    , flux=flux
+                    , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
+                )
+            elif profilename == "sersic":
+                profilegs = galsim.Sersic(
+                    n=profile["nser"]
+                    , half_light_radius=profile["re"]*np.sqrt(axrat)
+                    , flux=flux
+                    , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
+                )
+            elif profilename == "moffat":
+                profilegs = galsim.Moffat(
+                    beta=profile["con"]
+                    , fwhm=profile["fwhm"] * np.sqrt(axrat)
+                    , flux=flux
+                    , gsparams=galsim.GSParams(maximum_fft_size=4 * 4096)
+                )
+            else:
+                raise ValueError("Unknown galsim profile type [{:s}]".format(profilename))
+
+            profilegs = profilegs.shear(g=(1 - axrat) / (1 + axrat), beta=(profile["ang"]+90)*galsim.degrees)
+            if shiftxy:
+                profilegs = profilegs.shift(dx=profile["xcen"]-cenximg, dy=profile["ycen"]-cenyimg)
+
+            if "convolve" in profile and profile["convolve"]:
+                profilestype = "convolve"
+            else:
+                profilestype = "deconvolved"
+
+            if profilesgs[profilestype] is None:
+                profilesgs[profilestype] = profilegs
+            else:
+                profilesgs[profilestype] += profilegs
+
+    if profilesgs["convolve"] is None:
+        profilesgs["convolve"] = profilesgs["deconvolved"]
+    else:
+        if isinstance(psf, galsim.GSObject):
+            psfgs = psf
+        else:
+            psfgs = galsim.InterpolatedImage(galsim.ImageD(psf, scale=1))
+        profilesgs["convolve"] = galsim.Convolve(profilesgs["convolve"], psfgs)
+        if profilesgs["deconvolved"] is not None:
+            profilesgs["convolve"] += profilesgs["deconvolved"]
+
+    return profilesgs["convolve"]
+
+
+def make_model_image_galsim(model, image, method=None):
+    if method is None:
+        method = "auto"
+    scene = model.drawImage(image, method=method).array
+    # I'm not sure why this seems to be necessary but it's either overzealous garbage collection or PEBKAC
+    return scene
+
+
 def make_image_from_profiles(profiles, allparams, haspsf, data, use_calcinvmask=None):
     if use_calcinvmask is None:
         use_calcinvmask = False
@@ -146,7 +230,13 @@ def make_image_from_profiles(profiles, allparams, haspsf, data, use_calcinvmask=
 
     if use_calcinvmask:
         profit_model['calcmask'] = data.calcinvmask
-    model = np.array(pyprofit.make_model(profit_model)[0])
+    if data.engine == "libprofit":
+        model = np.array(pyprofit.make_model(profit_model)[0])
+    else:
+        # TODO: Change this to the model image size
+        model = make_model_galsim(
+            profit_model["profiles"], data.psf, data.image.shape[0], data.image.shape[1])
+        model = make_model_image_galsim(model, data.modelimage, method=data.method)
     return allparams, model
 
 
@@ -261,12 +351,16 @@ def unscale_params(params, tolog, sigmas):
 
 # invmask: An 'inverse' mask where ones are pixels to use and zeros are masked out
 # invsigim: An inverse sigma image (so one can multiply by it and save a few CPU cycles)
+# engine: One of "libprofit" or "galsim"
 # constraints: An arbitrary function that takes a model list (see above) and modifies it
 def setup_data(
     magzero, image, invmask, invsigim, psf,
     names, init, tofit, tolog, sigmas, priors, lowers, uppers,
-    constraints=None, use_calcinvmask=None, use_allpriors=None,
+    engine=None, constraints=None, use_calcinvmask=None, use_allpriors=None,
     method=None):
+
+    if engine is None:
+        engine = "libprofit"
 
     if use_calcinvmask is None:
         use_calcinvmask = False
@@ -286,19 +380,30 @@ def setup_data(
     # of pixels where we actually need to compute the model
     if psf is not None:
         method = "fft"
-        imgpsf = psf
-        imgpsf[imgpsf < 0] = 0
-        sumpsf = np.sum(psf)
-        if sumpsf != 1:
-            psf /= sumpsf
-        data.calcinvmask = signal.convolve2d(data.region, psf+1, mode='same')
-        data.calcinvmask = data.calcinvmask > 0
+        if isinstance(psf, galsim.GSObject):
+            # TODO: Think about whether we should allow finite support for GSObject PSFs
+            data.calcinvmask = None
+            data.use_calcinvmask = False
+        else:
+            imgpsf = psf
+            imgpsf[imgpsf < 0] = 0
+            sumpsf = np.sum(psf)
+            if sumpsf != 1:
+                psf /= sumpsf
+            data.calcinvmask = signal.convolve2d(data.region, psf+1, mode='same')
+            data.calcinvmask = data.calcinvmask > 0
     else:
         # Don't need to calculate the model in masked pixels without a psf
         data.calcinvmask = data.region
 
     data.use_calcinvmask = use_calcinvmask
     data.use_allpriors = use_allpriors
+    data.engine = engine
+    if data.engine == "galsim":
+        data.modelimage = galsim.ImageD(image.shape[0], image.shape[1], xmin=0, ymin=0, scale=1)
+    else:
+        # TODO: Have a cached image for libprofit too instead of re-allocating
+        pass
     data.method = method
     data.constraints = constraints
     data.magzero = magzero
@@ -456,7 +561,7 @@ def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printf
 
 # Params: a dict by profile type
 def fit_image(image, invmask, inverr, psf, params, plotinit=None, printfinal=None,
-              constraints=None, use_allpriors=None, method=None, **kwargs):
+              engine=None, constraints=None, use_allpriors=None, method=None, **kwargs):
     if plotinit is None:
         plotinit = False
     if printfinal is None:
@@ -488,7 +593,7 @@ def fit_image(image, invmask, inverr, psf, params, plotinit=None, printfinal=Non
     # Set up the initial structure that will hold all the data needed afterwards
     data = setup_data(
         0, image, invmask, inverr, psf, **paramssplit,
-        constraints=constraints, use_allpriors=use_allpriors, method=method
+        engine=engine, constraints=constraints, use_allpriors=use_allpriors, method=method
     )
 
     lpinit = like_model(data.init, data)
