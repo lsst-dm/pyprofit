@@ -284,7 +284,10 @@ def like_model(params, data):
     lp = ll + priorsum
 
     if data.verbose:
-        print(lp, {name: val for name, val in zip(data.names, allparams)})
+        print(params)
+        print(params*data.sigmas[data.tofit])
+        print(lp, ll, priorsum)
+        print({name: val for name, val in zip(data.names, allparams)})
     return lp
 
 
@@ -596,7 +599,11 @@ def fit_image(image, invmask, inverr, psf, params, plotinit=None, printfinal=Non
         engine=engine, constraints=constraints, use_allpriors=use_allpriors, method=method
     )
 
+    # Force verbose printing for initial params
+    verbosity = data.verbose
+    data.verbose = True
     lpinit = like_model(data.init, data)
+    data.verbose = verbosity
     if not np.isfinite(lpinit):
         raise ValueError("Non-finite initial LP")
     _, modelim0 = make_image(data.init, data, data.use_calcinvmask)
