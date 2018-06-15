@@ -5,7 +5,8 @@ import pyprofit.python.objects as proobj
 
 import argparse
 import fitsio
-import galsim
+import functools
+import galsim as gs
 import itertools
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,13 +15,13 @@ import select
 from skimage import measure
 import subprocess
 from subprocess import PIPE
+from scipy import stats
 
 algo_default = "lbfgs (pygmo), L-BFGS-B (scipy)"
 algos_lib_default = {"scipy": "L-BFGS-B", "pygmo": "lbfgs"}
 optlibs = ["pygmo", "scipy"]
 
-# Shamelessly stolen from astrometry.net
-# Returns (rtn, out, err)
+
 def run_command(cmd, timeout=None, callback=None, stdindata=None,
                 tostring=True):
     """
@@ -31,6 +32,8 @@ def run_command(cmd, timeout=None, callback=None, stdindata=None,
     will be converted to unicode, otherwise will be returned as bytes.
 
     Returns: (int return value, string out, string err)
+
+    Shamelessly stolen from astrometry.net
     """
     child = subprocess.Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds=True)
     (fin, fout, ferr) = (child.stdin, child.stdout, child.stderr)
@@ -288,6 +291,26 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
         prefix='-'.join(radec)
     )
     try:
+        if useobj:
+            powten = functools.partial(np.power, 10.0)
+
+            def normlogpdfmean(x, mean=0., scale=1.):
+                return stats.norm.logpdf(x - mean, scale=scale)
+
+            def truncnormlogpdfmean(x, mean=0., scale=1., a=-np.inf, b=np.inf):
+                return stats.truncnorm.logpdf(x - mean, scale=scale, a=a, b=b)
+
+            transformnone = proobj.Transform()
+            transformlog10 = proobj.Transform(transform=np.log10, reverse=powten)
+            transforminverse = proobj.Transform(transform=lambda x: 1. / x, reverse=lambda x: 1. / x)
+
+            limitsnone = proobj.Limits()
+            limitsfractionlog10 = proobj.Limits(upper=0., transformed=True)
+            limitsfraction = proobj.Limits(lower=0., upper=1., transformed=True)
+
+        maskinversepsf = np.full(psf.shape, True)
+        sigmainversepsf = psf*0.+np.prod(psf.shape)
+
         if psffit:
             psfmodel = psfmodel.split(",")[0].split(":")
             psfprofile = psfmodel[0]
@@ -297,135 +320,244 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
             isgaussian = psfprofile == "gaussian"
 
             size = np.sqrt(cenx ** 2.0 + ceny ** 2.0) / (4 + 0*isgaussian)
+            sizes = size + np.zeros(psfncomps)
+            sizes[0] /= 2.
             # This is going to be the fraction of the remaining flux in the previous component
             # (Confusing, I know, but it lets you fit the magnitude in the first component's mag)
-            fluxfrac = 1/np.arange(psfncomps, 0, -1)
+            fluxfracspsf = 1/np.arange(psfncomps, 0, -1)
 
-            if useobj:
-                pass
+            axrat = 0.8
+            angs = 90. * np.arange(psfncomps)/(psfncomps-(psfncomps > 1))
 
             if isgaussian:
                 psfprofile = "sersic"
 
             if psfprofile == "moffat":
                 shapename = "con"
+                sizename = "fwhm"
                 shapelog = False
-                shapelimits = np.flip(1./np.array(getlimits(shapename, psfprofile, shapelog)), 0)
-                shapes = [1./5.] + list(np.repeat(1./2.5, psfncomps-1.))
+                shapelimits = np.flip(1. / np.array(getlimits(shapename, psfprofile, shapelog)), 0)
+                shapes = 1.0/np.array([2.5] + list(np.repeat(5.0, psfncomps - 1.)))
+                if useobj:
+                    shapelimits = proobj.Limits(lower=shapelimits[0], upper=shapelimits[1], transformed=True)
             elif psfprofile == "sersic":
                 shapename = "nser"
+                sizename = "re"
                 shapelog = True
                 shapelimits = getlimits(shapename, psfprofile, shapelog)
                 shapes = np.repeat(0.5, psfncomps)
+                if useobj:
+                    shapelimits = proobj.Limits(lower=shapelimits[0], upper=shapelimits[1], transformed=True)
+                    shapes = np.log10(shapes)
             else:
                 shapename = ""
                 shapelimits = getlimits("", psfprofile)
                 shapes = None
                 shapelog = False
 
-            init = [np.array([cenx, ceny, 0, size/2, shapes[0], 0, 0.9, 0])]
-            tofit = [np.array([True, True, False, True, False, True, True, False])]
-            for comp in range(1, psfncomps, 1):
-                # These are obviously not very clever initial guesses
-                # One idea might be to add components one-by-one based on the residuals of the
-                # single-component fit
-                init += [np.array([np.nan, np.nan, np.log10(fluxfrac[comp-1]), size,
-                         shapes[comp], 90*comp/psfncomps, 0.8, 0])]
-                tofit += [np.array([False, False, True, True, False, True, True, False])]
+            if useobj:
+                exposurepsf = proobj.Exposure(band, image=psf, maskinverse=maskinversepsf,
+                                              sigmainverse=sigmainversepsf)
+                datapsf = proobj.Data([exposurepsf])
 
-            params = {
-                psfprofile: {
-                    "init": init
-                    , "tofit": tofit
-                    , "tolog": [np.array([False, False, False, True, shapelog, False, True, False])]
-                    , "sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])]
-                    , "lowers": [np.array([0.,           0,            -np.inf, 1e-3,
-                                           shapelimits[0], -180, -1,   -1])]
-                    , "uppers": [np.array([psf.shape[0], psf.shape[1], -0.1,       1e2,
-                                           shapelimits[1],  360, -1e-4, 1])]
+                if psfprofile == "moffat":
+                    transformshape = transforminverse
+                elif psfprofile == "sersic":
+                    transformshape = transformlog10
+                else:
+                    transformshape = transformnone
+                sigmafwhm = 1.
+                sigmaxy = 1.
+                limitsx = proobj.Limits(lower=0., upper=psf.shape[0])
+                limitsy = proobj.Limits(lower=0., upper=psf.shape[1])
+
+                paramsastrometry = [
+                    proobj.Parameter(
+                        "cenx", cenx, "pix", limitsx, transform=transformnone, transformed=True,
+                        prior=proobj.Prior(
+                            functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=psf.shape[0]),
+                            log=True, transformed=True, mode=cenx, limits=limitsx))
+                    , proobj.Parameter(
+                        "ceny", ceny, "pix", limitsy, transform=transformnone, transformed=True,
+                        prior=proobj.Prior(
+                            functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=psf.shape[1]),
+                            log=True, transformed=True, mode=ceny, limits=limitsy))
+                ]
+
+                modelastropsf = proobj.AstrometricModel(paramsastrometry)
+
+                componentspsf = []
+                for compi in range(psfncomps):
+                    islast = compi == (psfncomps - 1)
+                    paramflux = proobj.FluxParameter(
+                        band, "flux", np.log10(fluxfracspsf[compi]), "", limits=limitsfractionlog10,
+                        transform=transformlog10, transformed=True, prior=None, fixed=islast,
+                        isfluxratio=True)
+                    size = transformlog10.transform(sizes[compi])
+                    params = [
+                        proobj.Parameter(
+                            sizename, size, "", limitsnone,
+                            transform=transformlog10, transformed=True, prior=proobj.Prior(
+                                functools.partial(normlogpdfmean, mean=size, scale=sigmafwhm),
+                                log=True, transformed=True, mode=size, limits=limitsnone))
+                        , proobj.Parameter(
+                            shapename, shapes[compi], "", shapelimits, transform=transformshape,
+                            transformed=True, fixed=isgaussian,
+                            prior=proobj.Prior((lambda x: np.log10(x >= 0.)*(x <= 1.)), log=True,
+                                               transformed=True, mode=shapes[compi], limits=limitsfraction))
+                        , proobj.Parameter(
+                            "axrat", transformlog10.transform(axrat), "", limitsfractionlog10,
+                            transform=transformlog10, transformed=True, prior=proobj.Prior(
+                                functools.partial(stats.truncnorm.logpdf, scale=sigmafwhm, a=-np.Inf, b=0),
+                                log=True, transformed=True, mode=0, limits=limitsfractionlog10))
+                        , proobj.Parameter(
+                            "ang", angs[compi], gs.degrees, limitsnone, transform=transformnone,
+                            transformed=True,
+                            prior=proobj.Prior(lambda x: np.log(1./360.), log=True, transformed=True,
+                                               mode=180, limits=limitsnone))
+                    ]
+                    componentspsf.append(proobj.EllipticalProfile(
+                        [paramflux], profile=psfprofile, parameters=params))
+
+                paramfluxpsf = proobj.FluxParameter(
+                    band, "flux", 0, "", limits=limitsnone,
+                    transform=transformlog10, transformed=True, prior=None, fixed=True,
+                    isfluxratio=False)
+                modelphotopsf = proobj.PhotometricModel(componentspsf, [paramfluxpsf])
+
+                sourcepsf = proobj.Source(modelastropsf, modelphotopsf, "PSF")
+                modelpsf = proobj.Model([sourcepsf], datapsf, engine=engine)
+                modellerpsf = proobj.Modeller(modelpsf, modellib=optlib, modellibopts={"algo": algo})
+                modellerpsf.fit(printfinal=True, printsteps=100)
+            else:
+                init = [np.array([cenx, ceny, 0, sizes[0], shapes[0], angs[0], axrat, 0])]
+                tofit = [np.array([True, True, False, True, False, True, True, False])]
+                for comp in range(1, psfncomps, 1):
+                    # These are obviously not very clever initial guesses
+                    # One idea might be to add components one-by-one based on the residuals of the
+                    # single-component fit
+                    init += [np.array([np.nan, np.nan, np.log10(fluxfracspsf[comp-1]), sizes[comp],
+                             shapes[comp], angs[comp], axrat, 0])]
+                    tofit += [np.array([False, False, True, True, False, True, True, False])]
+
+                params = {
+                    psfprofile: {
+                        "init": init
+                        , "tofit": tofit
+                        , "tolog": [np.array([False, False, False, True, shapelog, False, True, False])]
+                        , "sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])]
+                        , "lowers": [np.array([0.,           0,            -np.inf, 1e-3,
+                                               shapelimits[0], -180, -1,   -1])]
+                        , "uppers": [np.array([psf.shape[0], psf.shape[1], -0.1,       1e2,
+                                               shapelimits[1],  360, -1e-4, 1])]
+                    }
                 }
-            }
 
-            # Yes this is ugly. It's the best way at the moment to fit a constrained total magnitude
-            # It should work for an unconstrained one too, but is that better than fitting components mags?
-            def constraints(cprofiles):
-                profilename = list(cprofiles.keys())[0]
-                comps = cprofiles[profilename]
-                ncomps = len(comps)
-                logflux = -0.4*comps[0]["mag"]
+                # Yes this is ugly. It's the best way at the moment to fit a constrained total magnitude
+                # It should work for an unconstrained one too, but is that better than fitting components mags?
+                def constraints(cprofiles):
+                    profilename = list(cprofiles.keys())[0]
+                    comps = cprofiles[profilename]
+                    ncomps = len(comps)
+                    logflux = -0.4*comps[0]["mag"]
 
-                for compidx in range(1, ncomps, 1):
-                    comps[compidx-1]["mag"] = -2.5*(logflux + comps[compidx]["mag"])
-                    logflux = np.log10(1-10**(comps[compidx]["mag"]+logflux))
+                    for compidx in range(1, ncomps, 1):
+                        comps[compidx-1]["mag"] = -2.5*(logflux + comps[compidx]["mag"])
+                        logflux = np.log10(1-10**(comps[compidx]["mag"]+logflux))
 
-                comps[ncomps-1]["mag"] = -2.5*logflux
+                    comps[ncomps-1]["mag"] = -2.5*logflux
 
-                if profilename == "moffat":
-                    for profile in cprofiles[profilename]:
-                        profile[shapename] = 1.0/profile[shapename]
+                    if profilename == "moffat":
+                        for profile in cprofiles[profilename]:
+                            profile[shapename] = 1.0/profile[shapename]
 
-                return cprofiles
+                    return cprofiles
 
-            imagegs = galsim.ImageD(psf, scale=1)
-            shapelet = galsim.Shapelet.fit(5, 10, imagegs)
+                imagegs = gs.ImageD(psf, scale=1)
+                shapelet = gs.Shapelet.fit(5, 10, imagegs)
 
-            paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
-                psf, psf*0+1, psf*0+np.prod(psf.shape), None, params, plotinit=True,
-                engine=engine, constraints=constraints, use_allpriors=True, method="fft",
-                optlib=optlib, algo=algo, grad=grad
-            )
-
-            if not isgaussian:
-                offset = 0
-                profiles_rebuilt, allparams, _ = pro.data_rebuild_profiles(
-                    paramsbest, data, applyconstraints=False)
-                for idx, tofitcomp in enumerate(params[psfprofile]["tofit"]):
-                    initcomp = params[psfprofile]["init"][idx]
-                    sumtofit = np.sum(tofitcomp)
-                    # TODO: This is hideous - is there a better way before adding Source/Model classes?
-                    # Selecting only tofitcomp isn't really necessary. Could check if not tofitcomp
-                    # are identical
-                    initbest = np.array(list(profiles_rebuilt[psfprofile][idx].values())[0:len(initcomp)])
-                    initcomp[tofitcomp] = initbest[tofitcomp]
-                    # Nans are inherited so skip checking them
-                    compstocheck = ~tofitcomp & ~np.isnan(initcomp)
-                    if not np.all(initcomp[compstocheck] == initbest[compstocheck]):
-                        raise RuntimeError("initcomp[compstocheck]=" + str(initcomp[compstocheck]) + \
-                            " differs from initbest[compstocheck]=" + str(initbest[compstocheck]) + \
-                            " but these should not have changed after fitting"
-                        )
-                    offset += sumtofit
-                    tofitcomp[4] = True
                 paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
-                    psf, psf*0+1, psf*0+np.prod(psf.shape), None, params, plotinit=False,
+                    psf, maskinversepsf, sigmainversepsf, None, params, plotinit=True,
                     engine=engine, constraints=constraints, use_allpriors=True, method="fft",
                     optlib=optlib, algo=algo, grad=grad
                 )
 
-            verifyreal = False
-            if verifyreal:
-                data.method = "real_space"
-                paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_data(
-                    data, init=paramsbest, optlib=optlib, algo=algo, grad=grad,
-                )
+                if not isgaussian:
+                    offset = 0
+                    profiles_rebuilt, allparams, _ = pro.data_rebuild_profiles(
+                        paramsbest, data, applyconstraints=False)
+                    for idx, tofitcomp in enumerate(params[psfprofile]["tofit"]):
+                        initcomp = params[psfprofile]["init"][idx]
+                        sumtofit = np.sum(tofitcomp)
+                        # TODO: This is hideous - is there a better way before adding Source/Model classes?
+                        # Selecting only tofitcomp isn't really necessary. Could check if not tofitcomp
+                        # are identical
+                        initbest = np.array(list(profiles_rebuilt[psfprofile][idx].values())[0:len(initcomp)])
+                        initcomp[tofitcomp] = initbest[tofitcomp]
+                        # Nans are inherited so skip checking them
+                        compstocheck = ~tofitcomp & ~np.isnan(initcomp)
+                        if not np.all(initcomp[compstocheck] == initbest[compstocheck]):
+                            raise RuntimeError("initcomp[compstocheck]=" + str(initcomp[compstocheck]) + \
+                                " differs from initbest[compstocheck]=" + str(initbest[compstocheck]) + \
+                                " but these should not have changed after fitting"
+                            )
+                        offset += sumtofit
+                        tofitcomp[4] = True
+                    paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
+                        psf, psf*0+1, psf*0+np.prod(psf.shape), None, params, plotinit=False,
+                        engine=engine, constraints=constraints, use_allpriors=True, method="fft",
+                        optlib=optlib, algo=algo, grad=grad
+                    )
 
-            if psfmodeluse:
-                if engine == "galsim":
-                    profiles, _, _ = pro.data_rebuild_profiles(paramsbest, data)
-                    psf = pro.make_model_galsim(profiles, None, None, None)
-                else:
-                    psfparams, psf = pro.make_image(paramsbest, data, False)
+                verifyreal = False
+                if verifyreal:
+                    data.method = "real_space"
+                    paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_data(
+                        data, init=paramsbest, optlib=optlib, algo=algo, grad=grad,
+                    )
+
+                if psfmodeluse:
+                    if engine == "galsim":
+                        profiles, _, _ = pro.data_rebuild_profiles(paramsbest, data)
+                        psf = pro.make_model_galsim(profiles, None, None, None)
+                    else:
+                        psfparams, psf = pro.make_image(paramsbest, data, False)
 
         nxy = image["data"].shape
         cenx, ceny = [x/2.0 for x in nxy]
         mag = -2.5*np.log10(np.sum(image["data"][image["invmask"]])/2)
         size = np.sqrt(cenx**2.0 + ceny**2.0)/4
+        sizes = [size, size/3.]
+
+        if useobj:
+            psfexp = proobj.PSF(band=band, image=psf)
+            exposure = proobj.Exposure(band, image["data"], image["invmask"], image["inverr"], psf=psfexp)
+            data = proobj.Data([exposure])
+
+            sigmaxy = 1.
+            limitsx = proobj.Limits(lower=0., upper=nxy[0])
+            limitsy = proobj.Limits(lower=0., upper=nxy[1])
+
+            paramsastrometry = [
+                proobj.Parameter(
+                    "cenx", cenx, "pix", limitsx, transform=transformnone, transformed=True,
+                    prior=proobj.Prior(
+                        functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=nxy[0]),
+                        log=True, transformed=True, mode=cenx, limits=limitsx))
+                , proobj.Parameter(
+                    "ceny", ceny, "pix", limitsy, transform=transformnone, transformed=True,
+                    prior=proobj.Prior(
+                        functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=nxy[1]),
+                        log=True, transformed=True, mode=ceny, limits=limitsy))
+            ]
+
+            modelastropsf = proobj.AstrometricModel(paramsastrometry)
 
         # Initial parameter guess - ellipses can be done better
         params = {
             "sersic": {
-                "init": [np.array([cenx, ceny, mag, size, 0.60, 130, 0.5, 0]),
-                         np.array([np.nan, np.nan, mag, size / 3, 1.15, 120, 0.7, 0])]
+                "init": [np.array([cenx, ceny, mag, sizes[0], 0.60, 130, 0.5, 0]),
+                         np.array([np.nan, np.nan, mag, sizes[1], 1.15, 120, 0.7, 0])]
                 , "tofit": [np.array([True, True, True, True, True, True, True, False]),
                             np.array([False, False, True, True, True, True, True, False])]
                 , "tolog": [np.array([False, False, False, True, True, False, True, False])]
@@ -471,6 +603,7 @@ if __name__ == '__main__':
         , "algo":      {"type": str,  "default": None, "desc": "Optimization algorithm"}
         , "grad":      {"type": str2bool, "default": False, "desc": "Use numerical gradient (pygmo)"}
         , "galsim":    {"type": str2bool, "default": False, "desc": "Use galsim for modeling"}
+        , "useobj":    {"type": str2bool, "default": False, "desc": "Use pyprofit object interface"}
     }
 
     for key, value in flags.items():
