@@ -85,7 +85,7 @@ class PSF:
             usemodel = self.usemodel
         if usemodel:
             return self.model
-        return self.image
+        return self.getimage()
 
     def getimageshape(self):
         if isinstance(self.image, gs.InterpolatedImage):
@@ -96,35 +96,43 @@ class PSF:
     def getimage(self, engine=None, size=None):
         if engine is None:
             engine = self.engine
+        if size is None and self.model is None:
+            size = self.getimageshape()
         if self.image is None or self.getimageshape() != size:
             if self.model is None:
                 raise RuntimeError("Can't get new PSF image without a model")
             self.image = self.model.getimage(self.band, nx=size[0], ny=size[1])
 
         # TODO: There's more torturous logic here if we're to support changing engines on the fly
-        if engine == "galsim":
-            self.image = gs.InterpolatedImage(gs.ImageD(self.image, scale=1))
-        else:
-            if self.engine != "galsim":
-                self.image = self.image.image.array
+        if engine != self.engine:
+            if engine == "galsim":
+                self.image = gs.InterpolatedImage(gs.ImageD(self.image, scale=1))
+            else:
+                if self.engine != "galsim":
+                    self.image = self.image.image.array
+            self.engine = engine
         return self.image
 
     def __init__(self, band, image=None, model=None, engine=None, usemodel=False):
         self.band = band
-        self.engine = engine
+        self.model = model
+        self.image = image
         if model is None:
             if image is None:
                 raise ValueError("PSF must be initialized with either a model or engine but both are none")
             if usemodel:
                 raise ValueError("PSF usemodel==True but no model specified")
+            if not isinstance(image, np.ndarray):
+                raise ValueError("PSF image must be an ndarray")
+            self.engine = "libprofit"
+            self.image = self.getimage(engine=engine)
         else:
             if image is not None:
                 raise ValueError("PSF initialized with a model cannot be initialized with an image as well")
             if not isinstance(model, Source):
                 raise ValueError("PSF model (type={:s}) not instanceof({:s})".format(
                     type(model), type(Source)))
-        self.model = model
-        self.image = image
+        self.engine = engine
 
 
 class Model:
@@ -228,8 +236,8 @@ class Model:
             profiles += bandprofiles[exposure.band]
 
         haspsf = exposure.psf is not None
-        allgaussian = haspsf and \
-            all([comp.isgaussian() for comp in exposure.psf.modelphotometric.components]) and \
+        allgaussian = haspsf and exposure.psf.model is not None and \
+            all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and \
             all([comp.isgaussian() for comp in [src.modelphotometric.components for src in self.sources]])
         if allgaussian:
             # TODO: actually implement this.
@@ -399,6 +407,19 @@ class ModellerPygmoUDP:
         self.boundsupper = boundsupper
         self.timing = timing
 
+    def __deepcopy__(self, memo):
+        modelself = self.modeller.model
+        model = Model(sources=copy.deepcopy(modelself.sources, memo=memo), data=modelself.data,
+                      likefunc=copy.copy(modelself.likefunc), engine=copy.copy(modelself.engine),
+                      engineopts=copy.copy(modelself.engineopts))
+        modeller = Modeller(model=model, modellib=copy.copy(self.modeller.modellib),
+                            modellibopts=copy.copy(self.modeller.modellibopts))
+        modeller.fitinfo = copy.copy(self.modeller.fitinfo)
+        copied = self.__class__(modeller=modeller, boundslower=copy.copy(self.boundslower),
+                                boundsupper=copy.copy(self.boundsupper), timing=copy.copy(self.timing))
+        memo[id(self)] = copied
+        return copied
+
 
 class Modeller:
     """
@@ -505,8 +526,9 @@ class Modeller:
                 limitslower[i] = limit[0]
                 limitsupper[i] = limit[1]
 
-            problem = pg.problem(ModellerPygmoUDP(modeller=self, boundslower=limitslower,
-                                                  boundsupper=limitsupper, timing=timing))
+            udp = ModellerPygmoUDP(modeller=self, boundslower=limitslower, boundsupper=limitsupper,
+                                   timing=timing)
+            problem = pg.problem(udp)
             pop = pg.population(prob=problem, size=0)
             if algocmaes:
                 npop = 5
@@ -548,7 +570,6 @@ class Modeller:
         self.fitinfo = {
             "priorLogfixed": np.log(1.0)
         }
-
 
 class Source:
     """
@@ -788,7 +809,7 @@ class EllipticalProfile(Component):
                     profile["profile"] = "sersic"
                     profile["nser"] = 0.5
                     if self.profile == "moffat":
-                        profile["re"] = profile["fwhm"]
+                        profile["re"] = profile["fwhm"]/2.0
                         del profile["fwhm"]
                         del profile["con"]
                     else:

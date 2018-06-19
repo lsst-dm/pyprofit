@@ -226,7 +226,7 @@ def gethsc(bands, ra, dec, prefix=None, **kwargs):
             rtn = downloadhsc(psfband, ra, dec, getpsf=True, hscfilter=bandname)
 
         fluxscale = headerimage["FLUXMAG0"]
-        data = fitsio.read(fitsband, ext=extensions["image"])/fluxscale
+        data = np.float64(fitsio.read(fitsband, ext=extensions["image"])/fluxscale)
 
         # Read the mask - it's not a segmentation map, but we can at least select all contiguous "detected"
         # pixels assuming the object is in the center
@@ -277,8 +277,8 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmodeluse=False, optlib="scipy",
-            algo=None, grad=False, galsim=False, useobj=False):
+def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", psfmodel=None,
+            psfmodeluse=False, optlib="scipy", algo=None, grad=False, galsim=False, useobj=False):
     if algo is None:
         algo = algos_lib_default[optlib]
 
@@ -306,6 +306,7 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
 
             limitsnone = proobj.Limits()
             limitsfractionlog10 = proobj.Limits(upper=0., transformed=True)
+            limitsaxratlog10 = proobj.Limits(lower=-3., upper=0., transformed=True)
             limitsfraction = proobj.Limits(lower=0., upper=1., transformed=True)
 
         maskinversepsf = np.full(psf.shape, True)
@@ -343,6 +344,8 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
             elif psfprofile == "sersic":
                 shapename = "nser"
                 sizename = "re"
+                if isgaussian:
+                    sizes /= 2.0
                 shapelog = True
                 shapelimits = getlimits(shapename, psfprofile, shapelog)
                 shapes = np.repeat(0.5, psfncomps)
@@ -406,10 +409,11 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
                             prior=proobj.Prior((lambda x: np.log10(x >= 0.)*(x <= 1.)), log=True,
                                                transformed=True, mode=shapes[compi], limits=limitsfraction))
                         , proobj.Parameter(
-                            "axrat", transformlog10.transform(axrat), "", limitsfractionlog10,
+                            "axrat", transformlog10.transform(axrat), "", limitsaxratlog10,
                             transform=transformlog10, transformed=True, prior=proobj.Prior(
-                                functools.partial(stats.truncnorm.logpdf, scale=sigmafwhm, a=-np.Inf, b=0),
-                                log=True, transformed=True, mode=0, limits=limitsfractionlog10))
+                                functools.partial(stats.truncnorm.logpdf, scale=1.0,
+                                                  a=limitsaxratlog10.lower, b=0),
+                                log=True, transformed=True, mode=0, limits=limitsaxratlog10))
                         , proobj.Parameter(
                             "ang", angs[compi], gs.degrees, limitsnone, transform=transformnone,
                             transformed=True,
@@ -523,16 +527,34 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
                     else:
                         psfparams, psf = pro.make_image(paramsbest, data, False)
 
+        model = model.split(",")[0].split(":")
+        profile = model[0]
+        ncomps = np.int(model[1])
         nxy = image["data"].shape
-        cenx, ceny = [x/2.0 for x in nxy]
-        mag = -2.5*np.log10(np.sum(image["data"][image["invmask"]])/2)
-        size = np.sqrt(cenx**2.0 + ceny**2.0)/4
+        cenx, ceny = np.array([x/2.0 for x in nxy])
+        fluxlog = np.log10(np.sum(image["data"][image["invmask"]]))
+        fluxfracs = 1 / np.arange(ncomps, 0, -1)
+        size = np.sqrt(cenx**2.0 + ceny**2.0)/5
         sizes = [size, size/3.]
+        shapes = [1.0, 2.0]
+        angs = np.array([120., 120.])
+        axrats = np.array([0.5, 0.8])
+        sigmare = 1.0
+        isgaussian = profile == "gaussian"
+        if isgaussian:
+            profile = "sersic"
+        sizename = "re"
+        shapename = "nser"
+        shapelimits = getlimits("nser", "sersic", True)
 
         if useobj:
-            psfexp = proobj.PSF(band=band, image=psf)
+            if psfmodeluse:
+                psfexp = proobj.PSF(band=band, model=sourcepsf)
+            else:
+                psfexp = proobj.PSF(band=band, image=psf)
             exposure = proobj.Exposure(band, image["data"], image["invmask"], image["inverr"], psf=psfexp)
             data = proobj.Data([exposure])
+            nxy = image["data"].shape
 
             sigmaxy = 1.
             limitsx = proobj.Limits(lower=0., upper=nxy[0])
@@ -551,33 +573,84 @@ def testhsc(radec=None, band=None, size=None, psffit=False, psfmodel=None, psfmo
                         log=True, transformed=True, mode=ceny, limits=limitsy))
             ]
 
-            modelastropsf = proobj.AstrometricModel(paramsastrometry)
+            modelastro = proobj.AstrometricModel(paramsastrometry)
 
-        # Initial parameter guess - ellipses can be done better
-        params = {
-            "sersic": {
-                "init": [np.array([cenx, ceny, mag, sizes[0], 0.60, 130, 0.5, 0]),
-                         np.array([np.nan, np.nan, mag, sizes[1], 1.15, 120, 0.7, 0])]
-                , "tofit": [np.array([True, True, True, True, True, True, True, False]),
-                            np.array([False, False, True, True, True, True, True, False])]
-                , "tolog": [np.array([False, False, False, True, True, False, True, False])]
-                , "sigmas": [np.array([2,           2,  5, 1,  1,   30, 0.3, 0.3])]
-                , "lowers": [np.array([0.,          0, 10, 0,  np.log10(0.5), -180,  -1, -1])]
-                , "uppers": [np.array([nxy[0], nxy[1], 30, 2,  np.log10(4),  360, -1e-4, 1])]
+            shapelimits = proobj.Limits(lower=shapelimits[0], upper=shapelimits[1])
+            transformshape = transformlog10
+            shapes = transformshape.transform(shapes)
+
+            components = []
+            for compi in range(ncomps):
+                islast = compi == (ncomps - 1)
+                paramflux = proobj.FluxParameter(
+                    band, "flux", np.log10(fluxfracs[compi]), "", limits=limitsfractionlog10,
+                    transform=transformlog10, transformed=True, prior=None, fixed=islast,
+                    isfluxratio=True)
+                size = transformlog10.transform(sizes[compi])
+                params = [
+                    proobj.Parameter(
+                        sizename, size, "", limitsnone,
+                        transform=transformlog10, transformed=True, prior=proobj.Prior(
+                            functools.partial(normlogpdfmean, mean=size, scale=sigmare),
+                            log=True, transformed=True, mode=size, limits=limitsnone))
+                    , proobj.Parameter(
+                        shapename, shapes[compi], "", shapelimits, transform=transformshape,
+                        transformed=True, fixed=isgaussian, prior=proobj.Prior(
+                            functools.partial(stats.truncnorm.logpdf, scale=sigmare, a=shapelimits.lower,
+                                              b=shapelimits.upper),
+                            log=True, transformed=True, mode=shapes[compi], limits=shapelimits))
+                    , proobj.Parameter(
+                        "axrat", transformlog10.transform(axrats[compi]), "", limitsaxratlog10,
+                        transform=transformlog10, transformed=True, prior=proobj.Prior(
+                            functools.partial(stats.truncnorm.logpdf, scale=0.3,
+                                              a=limitsaxratlog10.lower, b=0),
+                            log=True, transformed=True, mode=axrats[compi], limits=limitsaxratlog10))
+                    , proobj.Parameter(
+                        "ang", angs[compi], gs.degrees, limitsnone, transform=transformnone,
+                        transformed=True,
+                        prior=proobj.Prior(lambda x: np.log(1. / 360.), log=True, transformed=True,
+                                           mode=180, limits=limitsnone))
+                ]
+                components.append(proobj.EllipticalProfile(
+                    [paramflux], profile=profile, parameters=params))
+
+            paramflux = proobj.FluxParameter(
+                band, "flux", fluxlog, "", limits=limitsnone, transform=transformlog10,
+                transformed=True, fixed=False, isfluxratio=False, prior=proobj.Prior(
+                    functools.partial(normlogpdfmean, mean=fluxlog, scale=0.3),
+                    log=True, transformed=True, mode=0, limits=limitsfractionlog10))
+            modelphoto = proobj.PhotometricModel(components, [paramflux])
+
+            source = proobj.Source(modelastro, modelphoto, "Galaxy")
+            model = proobj.Model([source], data, engine=engine)
+            modeller = proobj.Modeller(model, modellib=optlib, modellibopts={"algo": algo})
+            modeller.fit(printfinal=True, printsteps=100)
+        else:
+            # Initial parameter guess - ellipses can be done better
+            fluxlog -= np.log10(ncomps)
+            params = {
+                "sersic": {
+                    "init": [np.array([cenx, ceny, -2.5*fluxlog, sizes[0], shapes[0], angs[0], axrats[0], 0]),
+                             np.array([np.nan, np.nan, -2.5*fluxlog, sizes[1], shapes[1], angs[1], axrats[1],
+                                       0])]
+                    , "tofit": [np.array([True, True, True, True, True, True, True, False]),
+                                np.array([False, False, True, True, True, True, True, False])]
+                    , "tolog": [np.array([False, False, False, True, True, False, True, False])]
+                    , "sigmas": [np.array([2,           2,  5, 1,  1,   30, 0.3, 0.3])]
+                    , "lowers": [np.array([0.,          0, 10, 0,  shapelimits[0], -180,  -1, -1])]
+                    , "uppers": [np.array([nxy[0], nxy[1], 30, 2,  shapelimits[1],  360, -1e-4, 1])]
+                }
             }
-        }
 
-        paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
-            image["data"], image["invmask"], image["inverr"], psf, params, engine=engine,
-            use_allpriors=True, method="fft", plotinit=True,
-            optlib=optlib, algo=algo, grad=grad
-        )
+            paramsbest, paramstransformed, paramslinear, timerun, data = pro.fit_image(
+                image["data"], image["invmask"], image["inverr"], psf, params, engine=engine,
+                use_allpriors=True, method="fft", plotinit=True,
+                optlib=optlib, algo=algo, grad=grad, printsteps=10
+            )
 
-        all_params, modelim  = pro.make_image(paramsbest, data, use_calcinvmask=False)
-        pro.plot_image_comparison(data.image, modelim, data.invsigim, data.region)
-        plt.show()
-
-#        input("Press Enter to continue...")
+            all_params, modelim  = pro.make_image(paramsbest, data, use_calcinvmask=False)
+            pro.plot_image_comparison(data.image, modelim, data.invsigim, data.region)
+            plt.show()
 
     except Exception as error:
         print(type(error))
@@ -592,6 +665,10 @@ if __name__ == '__main__':
         "radec":     {"type": str, "default": None, "desc": "RA,dec string (deg.)", "nargs": 2}
         , "band": {"type": str, "default": "HSC-R", "desc": 'HSC Band (g, r, i, z, y)'}
         , "size": {"type": str, "default": "20", "desc": 'Cutout half-size (asecs)'}
+        , "model":
+            {"type": str, "default": "sersic:1", "desc":
+                "Galaxy model description as comma-separated list of [profile]:[number];"
+                "only one profile type currently supported"}
         , "psffit": {"type": str2bool, "default": False, "nargs": '?', "desc": "Fit the PSF first"}
         , "psfmodeluse":
             {"type": str2bool, "default": False, "desc": "Use the fitted PSF model for galaxy fitting"}
