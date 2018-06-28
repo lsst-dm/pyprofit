@@ -17,7 +17,6 @@ import subprocess
 from subprocess import PIPE
 from scipy import stats
 
-algo_default = "lbfgs (pygmo), L-BFGS-B (scipy)"
 algos_lib_default = {"scipy": "L-BFGS-B", "pygmo": "lbfgs"}
 optlibs = ["pygmo", "scipy"]
 
@@ -281,7 +280,6 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
             psfmodeluse=False, optlib="scipy", algo=None, grad=False, galsim=False, useobj=False):
     if algo is None:
         algo = algos_lib_default[optlib]
-
     engine = None
     if galsim:
         engine = "galsim"
@@ -653,8 +651,7 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
             plt.show()
 
     except Exception as error:
-        print(type(error))
-        print(error.args)
+        #print(type(error))
         print(error)
 
 

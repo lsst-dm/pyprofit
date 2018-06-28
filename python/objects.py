@@ -1,6 +1,8 @@
 from abc import ABCMeta, abstractmethod
 import copy
 import galsim as gs
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import pygmo as pg
 import pyprofit as pyp
@@ -28,7 +30,7 @@ class Exposure:
     """
         A class to hold an image, sigma map, bad pixel mask and reference to a PSF model/image
     """
-    def __init__(self, band, image, maskinverse, sigmainverse, psf=None, calcinvmask=None, meta={}):
+    def __init__(self, band, image, maskinverse=None, sigmainverse=None, psf=None, calcinvmask=None, meta={}):
         if psf is not None and not isinstance(psf, PSF):
             raise TypeError("Exposure (band={}) PSF type={:s} not instanceof({:s})".format(
                 band, type(psf), type(PSF)))
@@ -88,6 +90,8 @@ class PSF:
         return self.getimage()
 
     def getimageshape(self):
+        if self.image is None:
+            return None
         if isinstance(self.image, gs.InterpolatedImage):
             return self.image.image.array.shape
         return self.image.shape
@@ -101,14 +105,26 @@ class PSF:
         if self.image is None or self.getimageshape() != size:
             if self.model is None:
                 raise RuntimeError("Can't get new PSF image without a model")
-            self.image = self.model.getimage(self.band, nx=size[0], ny=size[1])
+            exposure = Exposure(self.band, np.zeros(shape=size), None, None)
+            data = Data(exposures=[exposure])
+            model = Model(sources=[self.model], data=data)
+            # TODO: Think about the consequences of making a new astrometry vs resetting the old one
+            # It's necessary because the model needs to be centered and it might not be
+            astro = model.sources[0].modelastrometric
+            model.sources[0].modelastrometric = AstrometricModel([
+                Parameter("cenx", value=size[0]/2.),
+                Parameter("ceny", value=size[1]/2.),
+            ])
+            model.evaluate(keepimages=True, getlikelihood=False)
+            self.image = data.exposures[self.band][0].meta["modelimage"]
+            model.sources[0].modelastrometric = astro
 
         # TODO: There's more torturous logic here if we're to support changing engines on the fly
         if engine != self.engine:
             if engine == "galsim":
                 self.image = gs.InterpolatedImage(gs.ImageD(self.image, scale=1))
             else:
-                if self.engine != "galsim":
+                if self.engine == "galsim":
                     self.image = self.image.image.array
             self.engine = engine
         return self.image
@@ -132,7 +148,7 @@ class PSF:
             if not isinstance(model, Source):
                 raise ValueError("PSF model (type={:s}) not instanceof({:s})".format(
                     type(model), type(Source)))
-        self.engine = engine
+            self.engine = engine
 
 
 class Model:
@@ -150,15 +166,17 @@ class Model:
         if engine not in Model.ENGINES:
             raise ValueError("Unknown Model rendering engine {:s}".format(engine))
 
-    def evaluate(self, params=None, data=None, bands=None, engine=None,
+    def evaluate(self, params=None, data=None, bands=None, engine=None, engineopts=None,
                  paramstransformed=True, getlikelihood=True, likelihoodlog=True, keeplikelihood=False,
-                 keepimages=False):
+                 keepimages=False, plot=False):
         """
             Get the likelihood and/or model images
         """
         if engine is None:
             engine = self.engine
         Model._checkengine(engine)
+        if engineopts is None:
+            engineopts = self.engineopts
         if data is None:
             data = self.data
 
@@ -183,14 +201,26 @@ class Model:
 
         if bands is None:
             bands = data.exposures.keys()
+        if plot:
+            plotslen = 0
+            for band in bands:
+                plotslen += len(data.exposures[band])
+            figure, axes = plt.subplots(nrows=plotslen, ncols=5)
+            figurerow = 0
+        else:
+            figaxes = None
         for band in bands:
             # TODO: Check band
             for exposure in data.exposures[band]:
                 image = self.getexposuremodel(exposure, engine=engine)
                 if keepimages:
-                    exposure.meta["modelimage"] = image
-                if getlikelihood:
-                    likelihoodexposure = self.getexposurelikelihood(exposure, image, log=likelihoodlog)
+                    exposure.meta["modelimage"] = np.array(image)
+                if getlikelihood or plot:
+                    if plot:
+                        figaxes = (figure, axes[figurerow])
+                        figurerow += 1
+                    likelihoodexposure = self.getexposurelikelihood(
+                        exposure, image, log=likelihoodlog, figaxes=figaxes)
                     if keeplikelihood:
                         exposure.meta["likelihood"] = likelihoodexposure
                         exposure.meta["likelihoodlog"] = likelihoodlog
@@ -201,18 +231,56 @@ class Model:
 
         return likelihood, params
 
-    def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None):
+    def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None, figaxes=None):
         if likefunc is None:
             likefunc = self.likefunc
-        # Scale and stuff
-        chi = (exposure.image[exposure.maskinverse] - modelimage[exposure.maskinverse]) * \
-            exposure.sigmainverse[exposure.maskinverse]
+        hasmask = exposure.maskinverse is not None
+        if figaxes is not None:
+            axes = figaxes[1]
+            xlist = np.arange(0, modelimage.shape[1])
+            ylist = np.arange(0, modelimage.shape[0])
+            x, y = np.meshgrid(xlist, ylist)
+            chi = (exposure.image - modelimage)
+            # The original image
+            axes[0].imshow(exposure.image, cmap='gray', norm=mpl.colors.LogNorm())
+            if hasmask:
+                z = exposure.maskinverse
+                axes[0].contour(x, y, z)
+            # The model
+            axes[1].imshow(modelimage, cmap='gray', norm=mpl.colors.LogNorm())
+            if hasmask:
+                axes[1].contour(x, y, z)
+            # The difference map
+            axes[2].imshow(chi, cmap='gray', norm=mpl.colors.LogNorm())
+            if hasmask:
+                axes[2].contour(x, y, z)
+            # The chi (data-model)/error map clipped at +/- 5 sigma
+            chi *= exposure.sigmainverse
+            chisqred = np.sum(chi**2)/np.prod(chi.shape)
+            axes[2].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
+            chiclip = np.copy(chi)
+            chiclip[chi < -5] = -5
+            chiclip[chi > 5] = 5
+            axes[3].imshow(chiclip, cmap='gray', norm=mpl.colors.LogNorm())
+            if hasmask:
+                figaxes[3].contour(x, y, z)
+            # Residual histogram compared to a normal distribution
+            axes[4].hist(chi[~np.isnan(chi)], bins=100, log=True, density=True, histtype="step", fill=False)
+            plt.xlim(-5, 5)
+            plt.ylim(1e-4, 1)
+            x = np.linspace(-5., 5., int(1e4) + 1, endpoint=True)
+            axes[4].plot(x, spstats.norm.pdf(x))
+        else:
+            if hasmask:
+                chi = (exposure.image[exposure.maskinverse] - modelimage[exposure.maskinverse]) * \
+                    exposure.sigmainverse[exposure.maskinverse]
+            else:
+                chi = (exposure.image - modelimage)*exposure.sigmainverse
         if likefunc == "t":
             variance = chi.var()
             dof = 2. * variance / (variance - 1.)
             dof = max(min(dof, float('inf')), 0)
-
-            likelihood = np.sum(spstats.t.logpdf(nhi, dof))
+            likelihood = np.sum(spstats.t.logpdf(chi, dof))
         elif likefunc == "normal":
             likelihood = np.sum(spstats.norm.logpdf(chi))
         else:
@@ -220,25 +288,30 @@ class Model:
 
         if not log:
             likelihood = np.exp(likelihood)
+
         return likelihood
 
     # TODO: Implement analytic Gaussian convolution
-    def getexposuremodel(self, exposure, engine=None):
+    def getexposuremodel(self, exposure, engine=None, engineopts=None):
         """
             Draw model image for one exposure with one PSF
         """
         if engine is None:
             engine = self.engine
+        if engineopts is None:
+            engineopts = self.engineopts
         Model._checkengine(engine)
         nx, ny = exposure.image.shape
-        profiles = []
-        for bandprofiles in self.getprofiles([exposure.band], engine=engine):
-            profiles += bandprofiles[exposure.band]
+        band = exposure.band
+        profiles = self.getprofiles([band], engine=engine)
+#        for bandprofiles in self.getprofiles([band], engine=engine):
+#            profiles += bandprofiles[band]
 
         haspsf = exposure.psf is not None
         allgaussian = haspsf and exposure.psf.model is not None and \
             all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and \
-            all([comp.isgaussian() for comp in [src.modelphotometric.components for src in self.sources]])
+            all([comp.isgaussian() for comps in [src.modelphotometric.components for src in self.sources]
+                 for comp in comps])
         if allgaussian:
             # TODO: actually implement this.
             pass
@@ -246,6 +319,7 @@ class Model:
         if engine == "libprofit":
             profilespro = {}
             for profile in profiles:
+                profile = profile[band]
                 profiletype = profile["profile"]
                 if profiletype  not in profilespro:
                     profilespro[profiletype] = []
@@ -266,19 +340,25 @@ class Model:
                 , 'profiles': profilespro
             }
             if haspsf:
-                profit_model["psf"] = exposure.psf.getimage(engine)
+                shape = exposure.psf.getimageshape()
+                if shape is None:
+                    shape = [1 + np.int(x/2) for x in np.floor([nx, ny])]
+                profit_model["psf"] = exposure.psf.getimage(engine, size=shape)
 
             if exposure.calcinvmask is not None:
                 profit_model['calcmask'] = exposure.calcinvmask
             image = np.array(pyp.make_model(profit_model)[0])
-        elif self.engine == "galsim":
+        elif engine == "galsim":
             profilesgs = {
                 True: None
                 , False: None
             }
             cenimg = gs.PositionD(nx/2., ny/2.)
             for profile in profiles:
-                profilegs = profile["profile"].shear(profile["shear"]).shift(profile["offset"] - cenimg)
+                profile = profile[band]
+                profilegs = profile["profile"].shear(
+                    profile["shear"]).shift(
+                    profile["offset"] - cenimg)
                 convolve = haspsf and not profile["pointsource"]
                 if profilesgs[convolve] is None:
                     profilesgs[convolve] = profilegs
@@ -288,33 +368,57 @@ class Model:
             if haspsf:
                 psfgs = exposure.psf.model
                 if psfgs is None:
-                    profilespsf = exposure.psf.getimage(engine)
+                    profilespsf = exposure.psf.getimage(engine=engine)
                 else:
-                    psfgs = psfgs.getprofiles()
+                    psfgs = psfgs.getprofiles(bands=[band], engine=engine)
                     profilespsf = None
                     for profile in psfgs:
-                        profilegs = profile["profile"].shear(profile["shear"]).shift(
-                            profile["offset"] - cenimg)
+                        profile = profile[band]
+                        profilegs = profile["profile"].shear(profile["shear"])
+                        # TODO: Think about whether this would ever be necessary
+                        #.shift(profile["offset"] - cenimg)
                         if profilespsf is None:
                             profilespsf = profilegs
                         else:
                             profilespsf += profilegs
                 profilesgs[True] = gs.Convolve(profilesgs[True], profilespsf)
-                if profilesgs[False] is None:
-                    profilesgs = profilesgs[True]
-                else:
-                    profilesgs = profilesgs[True] + profilesgs[False]
             else:
                 if profilesgs[True] is not None:
                     raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
                         exposure.band))
-                profilesgs = profilesgs[False]
             if self.engineopts is not None and "drawmethod" in self.engineopts:
                 method = self.engineopts["drawmethod"]
             else:
                 method = "fft"
+            # Has a PSF, but it's not an analytic model, so it must be an image and therefore pixel
+            # convolution is already included for extended objects, which must use no_pixel
+            try:
+                haspsfimage = haspsf and psfgs is None and profilesgs[True] is not None
+                if haspsfimage:
+                    imagegs = profilesgs[True].drawImage(method="no_pixel", nx=nx, ny=ny, scale=1)
+                    if profilesgs[False] is not None:
+                        imagegs += profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=1)
+                else:
+                    if profilesgs[True] is not None:
+                        if profilesgs[False] is not None:
+                            profilesgs = profilesgs[True] + profilesgs[False]
+                        else:
+                            profilesgs = profilesgs[True]
+                    else:
+                        profilesgs = profilesgs[False]
+                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=1)
+            except RuntimeError as e:
+                if method == "fft":
+                    if haspsfimage:
+                        imagegs = profilesgs[True].drawImage(method="real_space", nx=nx, ny=ny, scale=1) + \
+                                  profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=1)
+                    else:
+                        imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=1)
+                else:
+                    raise e
+            except Exception as e:
+                raise e
             # TODO: Determine why this is necessary. Should we keep an imageD per exposure?
-            imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny)
             image = np.copy(imagegs.array)
 
         sumnotfinite = np.sum(~np.isfinite(image))
@@ -364,12 +468,11 @@ class Model:
         params = self.getparameters(free=free, fixed=fixed)
         return [param.getprior.mode for param in params]
 
-    def getlikelihood(self, params=None, data=None, log=True):
-
-        likelihood = self.evaluate(params, data, likelihoodlog=log)[0]
+    def getlikelihood(self, params=None, data=None, log=True, plot=False):
+        likelihood = self.evaluate(params, data, likelihoodlog=log, plot=plot)[0]
         return likelihood
 
-    def __init__(self, sources, data, likefunc="normal", engine=None, engineopts=None):
+    def __init__(self, sources, data=None, likefunc="normal", engine=None, engineopts=None):
         if engine is None:
             engine = "libprofit"
         for i, source in enumerate(sources):
@@ -378,10 +481,10 @@ class Model:
                     "Model source[{:d}] (type={:s}) is not an instance of {:s}".format(
                         i, type(source), type(Source))
                 )
-        if not isinstance(data, Data):
+        if data is not None and not isinstance(data, Data):
             raise TypeError(
                 "Model data (type={:s}) is not an instance of {:s}".format(
-                    type(data), type(Data))
+                    str(type(data)), str(Data))
             )
         self.sources = sources
         self.data = data
@@ -408,6 +511,10 @@ class ModellerPygmoUDP:
         self.timing = timing
 
     def __deepcopy__(self, memo):
+        """
+            This is some rather ugly code to make a deep copy of a modeller without copying the model's
+            data, which should be shared between all copies of a model (and its modeller).
+        """
         modelself = self.modeller.model
         model = Model(sources=copy.deepcopy(modelself.sources, memo=memo), data=modelself.data,
                       likefunc=copy.copy(modelself.likefunc), engine=copy.copy(modelself.engine),
@@ -429,13 +536,13 @@ class Modeller:
         running time, separate priors and likelihoods rather than just the objective, etc.).
     """
     # TODO: Implement
-    def evaluate(self, paramsfree, timing=False, returnlponly=False, returnlog=True):
+    def evaluate(self, paramsfree=None, timing=False, returnlponly=False, returnlog=True, plot=False):
 
         if timing:
             tinit = time.time()
         # TODO: Attempt to prevent/detect defeating this by modifying fixed/free params?
         prior = self.fitinfo["priorLogfixed"] + self.model.getpriorvalue(free=True, fixed=False)
-        likelihood = self.model.getlikelihood(paramsfree)
+        likelihood = self.model.getlikelihood(paramsfree, plot=plot)
         # return LL, LP, etc.
         if returnlponly:
             rv = likelihood + prior
@@ -547,7 +654,7 @@ class Modeller:
             timerun += time.time() - tinit
             paramsbest = result.champion_x
         else:
-            raise RuntimeError("Unknown optimization library " + self.optlib)
+            raise RuntimeError("Unknown optimization library " + self.modellib)
 
         if printfinal:
             print("Elapsed time: {:.1f}".format(timerun))
@@ -557,7 +664,7 @@ class Modeller:
             # TODO: Finish
             #print("Parameters (linear): " + ",".join(["{:.4e}".format(i) for i in paramstransformed]))
 
-        return paramsbest, timerun, result
+        return paramsbest, timerun, result, copy.copy(self.fitinfo)
 
     # TODO: Should constraints be implemented?
     def __init__(self, model, modellib, modellibopts, constraints=None):
@@ -761,12 +868,17 @@ class EllipticalProfile(Component):
             flux = fluxesbands[band].getvalue(transformed=False)
             if fluxesbands[band].isfluxratio:
                 fluxratio = copy.copy(flux)
+                if not 0 <= fluxratio <= 1:
+                    raise ValueError("flux ratio not 0 <= {} <= 1".format(fluxratio))
                 flux *= bandfluxes[band]
                 # bandfluxes[band] -= flux
                 # TODO: Is subtracting as above best? Should be more accurate, but mightn't guarantee flux>=0
                 bandfluxes[band] *= (1.0-fluxratio)
             profile = {param.name: param.getvalue(transformed=False) for param in
                        self.parameters.values()}
+            if not 0 < profile["axrat"] <= 1:
+                raise ValueError("axrat {} ! >0 and <=1".format(profile["axrat"]))
+
             cens = {"cenx": cenx, "ceny": ceny}
             for key, value in cens.items():
                 if key in profile:
@@ -777,14 +889,18 @@ class EllipticalProfile(Component):
                 axrat = profile["axrat"]
                 axratsqrt = np.sqrt(axrat)
                 if isgaussian:
-                    fwhmkey = "fwhm"
                     if self.profile == "sersic":
-                        fwhmkey = "re"
+                        fwhm = 2.*profile["re"]
+                    else:
+                        fwhm = profile["fwhm"]
                     profilegs = gs.Gaussian(
-                        fwhm=profile[fwhmkey]*axratsqrt
+                        fwhm=fwhm*axratsqrt
                         , flux=flux
                     )
                 elif self.profile == "sersic":
+                    if profile["nser"] < 0.3 or profile["nser"] > 6.2:
+                        print("Warning: Sersic n {:.3f} not >= 0.3 and <= 6.2; GalSim could fail.".format(
+                            profile["nser"]))
                     profilegs = gs.Sersic(
                         n=profile["nser"]
                         , half_light_radius=profile["re"]*axratsqrt
@@ -820,7 +936,7 @@ class EllipticalProfile(Component):
             else:
                 raise ValueError("Unimplemented rendering engine {:s}".format(engine))
             profile["pointsource"] = False
-            profiles[band] = [profile]
+            profiles[band] = profile
         return profiles
 
     @classmethod
@@ -912,7 +1028,7 @@ class PointSourceProfile(Component):
                 profile["pointsource"] = True
             else:
                 raise ValueError("Unimplemented PointSourceProfile rendering engine {:s}".format(engine))
-            profiles[band] = [profile]
+            profiles[band] = profile
         return profiles
 
     def __init__(self, fluxes, name=""):
@@ -943,16 +1059,7 @@ class Limits:
         Limits for a Parameter.
     """
     def within(self, value):
-        if self.lowerinclusive:
-            within = value >= self.lower
-        else:
-            within = value > self.lower
-        if within:
-            if self.upperinclusive:
-                within = value <= self.upper
-            else:
-                within = value < self.upper
-        return within
+        return self.lower <= value <= self.upper
 
     def __init__(self, lower=-np.inf, upper=np.inf, lowerinclusive=True, upperinclusive=True,
                  transformed=True):
@@ -963,10 +1070,13 @@ class Limits:
                 lower, upper, isnanlower, isnanupper))
         if not upper >= lower:
             raise ValueError("Limits upper={} !>= lower{}".format(lower, upper))
+        # TODO: Should pass in the transform and check if lower
+        if not lowerinclusive:
+            lower = np.nextafter(lower, lower+1.)
+        if not upperinclusive:
+            upper = np.nextafter(upper, upper-1.)
         self.lower = lower
         self.upper = upper
-        self.lowerinclusive = lowerinclusive
-        self.upperinclusive = upperinclusive
         self.transformed = transformed
 
 
@@ -1009,12 +1119,12 @@ class Parameter:
             if value < self.limits.lower:
                 value = self.limits.lower
         if transformed and not self.transformed:
-            value = self.transform.transform(value)
-        elif not transformed and self.transformed:
             value = self.transform.reverse(value)
+        elif not transformed and self.transformed:
+            value = self.transform.transform(value)
         self.value = value
 
-    def __init__(self, name, value, unit, limits=None, transform=Transform(), transformed=True, prior=None,
+    def __init__(self, name, value, unit="", limits=None, transform=Transform(), transformed=True, prior=None,
                  fixed=False):
         if prior is not None and not isinstance(prior, Prior):
             raise TypeError("prior (type={:s}) is not an instance of {:s}".format(type(prior), type(Prior)))
@@ -1039,7 +1149,7 @@ class FluxParameter(Parameter):
         A flux, magnitude or flux ratio, all of which one could conceivably fit.
         TODO: name seems a bit redundant, but I don't want to commit to storing the band as a string now
     """
-    def __init__(self, band, name, value, unit, limits, transform=None, transformed=None, prior=None,
+    def __init__(self, band, name, value, unit, limits, transform=None, transformed=True, prior=None,
                  fixed=None, isfluxratio=None):
         if isfluxratio is None:
             isfluxratio = False
