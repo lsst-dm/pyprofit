@@ -206,6 +206,8 @@ class Model:
             for band in bands:
                 plotslen += len(data.exposures[band])
             figure, axes = plt.subplots(nrows=plotslen, ncols=5)
+            if plotslen == 1:
+                axes.shape = (1, 5)
             figurerow = 0
         else:
             figaxes = None
@@ -246,6 +248,7 @@ class Model:
             if hasmask:
                 z = exposure.maskinverse
                 axes[0].contour(x, y, z)
+            axes[0].set_title('Band={}'.format(exposure.band))
             # The model
             axes[1].imshow(modelimage, cmap='gray', norm=mpl.colors.LogNorm())
             if hasmask:
@@ -321,10 +324,14 @@ class Model:
             for profile in profiles:
                 profile = profile[band]
                 profiletype = profile["profile"]
-                if profiletype  not in profilespro:
+                if profiletype not in profilespro:
                     profilespro[profiletype] = []
                 del profile["profile"]
-                profile["convolve"] = haspsf and not profile["pointsource"]
+                if not profile["pointsource"]:
+                    profile["convolve"] = haspsf
+                    if not profile["resolved"]:
+                        raise RuntimeError("libprofit can't handle non-point sources that aren't resolved"
+                                           "(i.e. profiles with size==0)")
                 del profile["pointsource"]
                 # TODO: Find a better way to do this
                 for coord in ["x", "y"]:
@@ -334,10 +341,10 @@ class Model:
                 profilespro[profiletype] += [profile]
 
             profit_model = {
-                'width': nx
-                , 'height': ny
-                , 'magzero': 0.0
-                , 'profiles': profilespro
+                'width': nx,
+                'height': ny,
+                'magzero': 0.0,
+                'profiles': profilespro,
             }
             if haspsf:
                 shape = exposure.psf.getimageshape()
@@ -356,10 +363,15 @@ class Model:
             cenimg = gs.PositionD(nx/2., ny/2.)
             for profile in profiles:
                 profile = profile[band]
-                profilegs = profile["profile"].shear(
-                    profile["shear"]).shift(
-                    profile["offset"] - cenimg)
-                convolve = haspsf and not profile["pointsource"]
+                if not profile["pointsource"] and not profile["resolved"]:
+                    profile["pointsource"] = True
+                    raise RuntimeError("Converting small profiles to point sources not implemented yet")
+                    # TODO: Finish this
+                else:
+                    profilegs = profile["profile"].shear(
+                        profile["shear"]).shift(
+                        profile["offset"] - cenimg)
+                    convolve = haspsf and not profile["pointsource"]
                 if profilesgs[convolve] is None:
                     profilesgs[convolve] = profilegs
                 else:
@@ -423,7 +435,7 @@ class Model:
 
         sumnotfinite = np.sum(~np.isfinite(image))
         if sumnotfinite > 0:
-            raise RuntimeError("{:s}.getexposuremodel() got {:d} non-finite pixels out of {:d}".format(
+            raise RuntimeError("{}.getexposuremodel() got {:d} non-finite pixels out of {:d}".format(
                 type(self), sumnotfinite, np.prod(image.shape)
             ))
 
@@ -664,7 +676,13 @@ class Modeller:
             # TODO: Finish
             #print("Parameters (linear): " + ",".join(["{:.4e}".format(i) for i in paramstransformed]))
 
-        return paramsbest, timerun, result, copy.copy(self.fitinfo)
+        result = {
+            "fitinfo": copy.copy(self.fitinfo),
+            "paramsbest": paramsbest,
+            "result": result,
+            "time": timerun,
+        }
+        return result
 
     # TODO: Should constraints be implemented?
     def __init__(self, model, modellib, modellibopts, constraints=None):
@@ -880,62 +898,72 @@ class EllipticalProfile(Component):
                 raise ValueError("axrat {} ! >0 and <=1".format(profile["axrat"]))
 
             cens = {"cenx": cenx, "ceny": ceny}
+            # Does this profile have a non-zero size?
+            # TODO: Review cutoff - it can't be zero for galsim or it will request huge FFTs
+            resolved = not (
+                (self.profile == "sersic" and profile["re"] < 1e-3*(engine == "galsim")) or
+                (self.profile == "moffat" and profile["fwhm"] < 5e-4*(engine == "galsim"))
+            )
             for key, value in cens.items():
                 if key in profile:
                     profile[key] += value
                 else:
                     profile[key] = copy.copy(value)
-            if engine == "galsim":
-                axrat = profile["axrat"]
-                axratsqrt = np.sqrt(axrat)
-                if isgaussian:
-                    if self.profile == "sersic":
-                        fwhm = 2.*profile["re"]
+            if resolved:
+                if engine == "galsim":
+                    axrat = profile["axrat"]
+                    axratsqrt = np.sqrt(axrat)
+                    if isgaussian:
+                        if self.profile == "sersic":
+                            fwhm = 2.*profile["re"]
+                        else:
+                            fwhm = profile["fwhm"]
+                        profilegs = gs.Gaussian(
+                            fwhm=fwhm*axratsqrt, flux=flux
+                        )
+                    elif self.profile == "sersic":
+                        if profile["nser"] < 0.3 or profile["nser"] > 6.2:
+                            print("Warning: Sersic n {:.3f} not >= 0.3 and <= 6.2; "
+                                  "GalSim could fail.".format(profile["nser"]))
+                        profilegs = gs.Sersic(
+                            n=profile["nser"],
+                            half_light_radius=profile["re"]*axratsqrt,
+                            flux=flux
+                        )
+                    elif self.profile == "moffat":
+                        profilegs = gs.Moffat(
+                            beta=profile["con"],
+                            fwhm=profile["fwhm"]*axratsqrt,
+                            flux=flux
+                        )
+                    profile = {
+                        "profile": profilegs,
+                        "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=(profile["ang"] + 90.)*gs.degrees),
+                        "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
+                    }
+                elif engine == "libprofit":
+                    profile["mag"] = -2.5 * np.log10(flux)
+                    # TODO: Review this. It might not be a great idea because Sersic != Moffat integration
+                    # libprofit should be able to handle Moffats with infinite con
+                    if self.profile != "sersic" and self.isgaussian():
+                        profile["profile"] = "sersic"
+                        profile["nser"] = 0.5
+                        if self.profile == "moffat":
+                            profile["re"] = profile["fwhm"]/2.0
+                            del profile["fwhm"]
+                            del profile["con"]
+                        else:
+                            raise RuntimeError("No implentation for turning profile {:s} into gaussian".format(
+                                profile))
                     else:
-                        fwhm = profile["fwhm"]
-                    profilegs = gs.Gaussian(
-                        fwhm=fwhm*axratsqrt
-                        , flux=flux
-                    )
-                elif self.profile == "sersic":
-                    if profile["nser"] < 0.3 or profile["nser"] > 6.2:
-                        print("Warning: Sersic n {:.3f} not >= 0.3 and <= 6.2; GalSim could fail.".format(
-                            profile["nser"]))
-                    profilegs = gs.Sersic(
-                        n=profile["nser"]
-                        , half_light_radius=profile["re"]*axratsqrt
-                        , flux=flux
-                    )
-                elif self.profile == "moffat":
-                    profilegs = gs.Moffat(
-                        beta=profile["con"]
-                        , fwhm=profile["fwhm"]*axratsqrt
-                        , flux=flux
-                    )
-                profile = {
-                    "profile": profilegs
-                    , "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=(profile["ang"] + 90.)*gs.degrees)
-                    , "offset": gs.PositionD(profile["cenx"], profile["ceny"])
-                }
-            elif engine == "libprofit":
-                profile["mag"] = -2.5 * np.log10(flux)
-                # TODO: Review this. It might not be a great idea because Sersic != Moffat integration
-                # libprofit should be able to handle Moffats with infinite con
-                if self.profile != "sersic" and self.isgaussian():
-                    profile["profile"] = "sersic"
-                    profile["nser"] = 0.5
-                    if self.profile == "moffat":
-                        profile["re"] = profile["fwhm"]/2.0
-                        del profile["fwhm"]
-                        del profile["con"]
-                    else:
-                        raise RuntimeError("No implentation for turning profile {:s} into gaussian".format(
-                            profile))
+                        profile["profile"] = self.profile
                 else:
-                    profile["profile"] = self.profile
+                    raise ValueError("Unimplemented rendering engine {:s}".format(engine))
             else:
-                raise ValueError("Unimplemented rendering engine {:s}".format(engine))
+                profile["flux"] = flux
+            # This profile is part of a point source *model*
             profile["pointsource"] = False
+            profile["resolved"] = resolved
             profiles[band] = profile
         return profiles
 
