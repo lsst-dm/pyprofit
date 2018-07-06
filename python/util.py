@@ -8,8 +8,9 @@ import pyprofit.python.objects as proobj
 transformsref = {
     "none": proobj.Transform(),
     "log": proobj.Transform(transform=np.log, reverse=np.exp),
-    "log10": proobj.Transform(transform=np.log10, reverse=functools.partial(np.power, 10.0)),
-    "inverse": proobj.Transform(transform=lambda x: 1. / x, reverse=lambda x: 1. / x)
+    "log10": proobj.Transform(transform=np.log10, reverse=functools.partial(np.power, 10.)),
+    "inverse": proobj.Transform(transform=functools.partial(np.divide, 1.),
+                                reverse=functools.partial(np.divide, 1.)),
 }
 
 
@@ -73,12 +74,14 @@ def getparamdefault(param, value=None, profile=None, fixed=False):
             name = "con"
             transform = transformsref["inverse"]
             limits = limitsref["coninverse"]
-            value = 2.5
+            if value is None:
+                value = 2.5
         elif profile == "sersic":
             name = "nser"
             transform = transformsref["log10"]
             limits = limitsref["nserlog10"]
-            value = 0.5
+            if value is None:
+                value = 0.5
     elif param == "size" or param == "axrat":
         transform = transformsref["log10"]
         if param == "axrat":
