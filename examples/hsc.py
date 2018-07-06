@@ -124,11 +124,11 @@ def downloadhsc(outfile, ra, dec, semiwidth=None, semiheight=None, getpsf=None, 
         getpsf = False
 
     values = {
-        "ra": ra
-        , "dec": dec
-        , "type": imgtype
-        , "filter": hscfilter
-        , "rerun": rerun
+        "ra": ra,
+        "dec": dec,
+        "type": imgtype,
+        "filter": hscfilter,
+        "rerun": rerun,
     }
 
     if not getpsf:
@@ -199,9 +199,9 @@ def gethsc(bands, ra, dec, prefix=None, **kwargs):
 
     bandshsc = ["HSC-" + band for band in ["G", "R", "I", "Z", "Y"]] + ["NB" + ang for ang in ["0816", "0921"]]
     extensions = {
-        "image": "IMAGE"
-        , "mask": "MASK"
-        , "variance": "VARIANCE"
+        "image": "IMAGE",
+        "mask": "MASK",
+        "variance": "VARIANCE",
     }
 
     for idxband, bandname in enumerate(bands):
@@ -243,12 +243,12 @@ def gethsc(bands, ra, dec, prefix=None, **kwargs):
         psf = fitsio.read(psfband)
 
         image = {
-            "data": data
-            , "invvar": fluxscale**2/variance
-            , "inverr": fluxscale/np.sqrt(variance)
-            , "invmask" : invmask
-            , "header": fitsio.read_header(fitsband, extensions["image"])
-            , "name": '_'.join(["coadd", bandname])
+            "data": data,
+            "invvar": fluxscale**2/variance,
+            "inverr": fluxscale/np.sqrt(variance),
+            "invmask": invmask,
+            "header": fitsio.read_header(fitsband, extensions["image"]),
+            "name": '_'.join(["coadd", bandname]),
         }
         return image, psf
 
@@ -377,8 +377,8 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
                         "cenx", cenx, "pix", limitsx, transform=transformnone, transformed=True,
                         prior=proobj.Prior(
                             functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=psf.shape[0]),
-                            log=True, transformed=True, mode=cenx, limits=limitsx))
-                    , proobj.Parameter(
+                            log=True, transformed=True, mode=cenx, limits=limitsx)),
+                    proobj.Parameter(
                         "ceny", ceny, "pix", limitsy, transform=transformnone, transformed=True,
                         prior=proobj.Prior(
                             functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=psf.shape[1]),
@@ -400,19 +400,19 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
                             sizename, size, "", limitsnone,
                             transform=transformlog10, transformed=True, prior=proobj.Prior(
                                 functools.partial(normlogpdfmean, mean=size, scale=sigmafwhm),
-                                log=True, transformed=True, mode=size, limits=limitsnone))
-                        , proobj.Parameter(
+                                log=True, transformed=True, mode=size, limits=limitsnone)),
+                        proobj.Parameter(
                             shapename, shapes[compi], "", shapelimits, transform=transformshape,
                             transformed=True, fixed=isgaussian,
                             prior=proobj.Prior((lambda x: np.log10(x >= 0.)*(x <= 1.)), log=True,
-                                               transformed=True, mode=shapes[compi], limits=limitsfraction))
-                        , proobj.Parameter(
+                                               transformed=True, mode=shapes[compi], limits=limitsfraction)),
+                        proobj.Parameter(
                             "axrat", transformlog10.transform(axrat), "", limitsaxratlog10,
                             transform=transformlog10, transformed=True, prior=proobj.Prior(
                                 functools.partial(stats.truncnorm.logpdf, scale=1.0,
                                                   a=limitsaxratlog10.lower, b=0),
-                                log=True, transformed=True, mode=0, limits=limitsaxratlog10))
-                        , proobj.Parameter(
+                                log=True, transformed=True, mode=0, limits=limitsaxratlog10)),
+                        proobj.Parameter(
                             "ang", angs[compi], gs.degrees, limitsnone, transform=transformnone,
                             transformed=True,
                             prior=proobj.Prior(lambda x: np.log(1./360.), log=True, transformed=True,
@@ -444,14 +444,14 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
 
                 params = {
                     psfprofile: {
-                        "init": init
-                        , "tofit": tofit
-                        , "tolog": [np.array([False, False, False, True, shapelog, False, True, False])]
-                        , "sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])]
-                        , "lowers": [np.array([0.,           0,            -np.inf, 1e-3,
-                                               shapelimits[0], -180, -1,   -1])]
-                        , "uppers": [np.array([psf.shape[0], psf.shape[1], -0.1,       1e2,
-                                               shapelimits[1],  360, -1e-4, 1])]
+                        "init": init,
+                        "tofit": tofit,
+                        "tolog": [np.array([False, False, False, True, shapelog, False, True, False])],
+                        "sigmas": [np.array([2, 2, 5, 1, 1, 30, 0.3, 0.3])],
+                        "lowers": [np.array([0.,           0,            -np.inf, 1e-3,
+                                               shapelimits[0], -180, -1,   -1])],
+                        "uppers": [np.array([psf.shape[0], psf.shape[1], -0.1,       1e2,
+                                               shapelimits[1],  360, -1e-4, 1])],
                     }
                 }
 
@@ -563,8 +563,8 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
                     "cenx", cenx, "pix", limitsx, transform=transformnone, transformed=True,
                     prior=proobj.Prior(
                         functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=nxy[0]),
-                        log=True, transformed=True, mode=cenx, limits=limitsx))
-                , proobj.Parameter(
+                        log=True, transformed=True, mode=cenx, limits=limitsx)),
+                proobj.Parameter(
                     "ceny", ceny, "pix", limitsy, transform=transformnone, transformed=True,
                     prior=proobj.Prior(
                         functools.partial(truncnormlogpdfmean, scale=sigmaxy, a=0., b=nxy[1]),
@@ -590,20 +590,20 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
                         sizename, size, "", limitsnone,
                         transform=transformlog10, transformed=True, prior=proobj.Prior(
                             functools.partial(normlogpdfmean, mean=size, scale=sigmare),
-                            log=True, transformed=True, mode=size, limits=limitsnone))
-                    , proobj.Parameter(
+                            log=True, transformed=True, mode=size, limits=limitsnone)),
+                    proobj.Parameter(
                         shapename, shapes[compi], "", shapelimits, transform=transformshape,
                         transformed=True, fixed=isgaussian, prior=proobj.Prior(
                             functools.partial(stats.truncnorm.logpdf, scale=sigmare, a=shapelimits.lower,
                                               b=shapelimits.upper),
-                            log=True, transformed=True, mode=shapes[compi], limits=shapelimits))
-                    , proobj.Parameter(
+                            log=True, transformed=True, mode=shapes[compi], limits=shapelimits)),
+                    proobj.Parameter(
                         "axrat", transformlog10.transform(axrats[compi]), "", limitsaxratlog10,
                         transform=transformlog10, transformed=True, prior=proobj.Prior(
                             functools.partial(stats.truncnorm.logpdf, scale=0.3,
                                               a=limitsaxratlog10.lower, b=0),
-                            log=True, transformed=True, mode=axrats[compi], limits=limitsaxratlog10))
-                    , proobj.Parameter(
+                            log=True, transformed=True, mode=axrats[compi], limits=limitsaxratlog10)),
+                    proobj.Parameter(
                         "ang", angs[compi], gs.degrees, limitsnone, transform=transformnone,
                         transformed=True,
                         prior=proobj.Prior(lambda x: np.log(1. / 360.), log=True, transformed=True,
@@ -630,13 +630,13 @@ def testhsc(radec=None, band=None, size=None, psffit=False, model="sersic:1", ps
                 "sersic": {
                     "init": [np.array([cenx, ceny, -2.5*fluxlog, sizes[0], shapes[0], angs[0], axrats[0], 0]),
                              np.array([np.nan, np.nan, -2.5*fluxlog, sizes[1], shapes[1], angs[1], axrats[1],
-                                       0])]
-                    , "tofit": [np.array([True, True, True, True, True, True, True, False]),
-                                np.array([False, False, True, True, True, True, True, False])]
-                    , "tolog": [np.array([False, False, False, True, True, False, True, False])]
-                    , "sigmas": [np.array([2,           2,  5, 1,  1,   30, 0.3, 0.3])]
-                    , "lowers": [np.array([0.,          0, 10, 0,  shapelimits[0], -180,  -1, -1])]
-                    , "uppers": [np.array([nxy[0], nxy[1], 30, 2,  shapelimits[1],  360, -1e-4, 1])]
+                                       0])],
+                    "tofit": [np.array([True, True, True, True, True, True, True, False]),
+                              np.array([False, False, True, True, True, True, True, False])],
+                    "tolog": [np.array([False, False, False, True, True, False, True, False])],
+                    "sigmas": [np.array([2,           2,  5, 1,  1,   30, 0.3, 0.3])],
+                    "lowers": [np.array([0.,          0, 10, 0,  shapelimits[0], -180,  -1, -1])],
+                    "uppers": [np.array([nxy[0], nxy[1], 30, 2,  shapelimits[1],  360, -1e-4, 1])],
                 }
             }
 
@@ -659,25 +659,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="PyProFit fitting GAMA galaxy")
 
     flags = {
-        "radec":     {"type": str, "default": None, "desc": "RA,dec string (deg.)", "nargs": 2}
-        , "band": {"type": str, "default": "HSC-R", "desc": 'HSC Band (g, r, i, z, y)'}
-        , "size": {"type": str, "default": "20", "desc": 'Cutout half-size (asecs)'}
-        , "model":
+        "radec":     {"type": str, "default": None, "desc": "RA,dec string (deg.)", "nargs": 2},
+        "band": {"type": str, "default": "HSC-R", "desc": 'HSC Band (g, r, i, z, y)'},
+        "size": {"type": str, "default": "20", "desc": 'Cutout half-size (asecs)'},
+        "model":
             {"type": str, "default": "sersic:1", "desc":
                 "Galaxy model description as comma-separated list of [profile]:[number];"
-                "only one profile type currently supported"}
-        , "psffit": {"type": str2bool, "default": False, "nargs": '?', "desc": "Fit the PSF first"}
-        , "psfmodeluse":
-            {"type": str2bool, "default": False, "desc": "Use the fitted PSF model for galaxy fitting"}
-        , "psfmodel":
+                "only one profile type currently supported"},
+        "psffit": {"type": str2bool, "default": False, "nargs": '?', "desc": "Fit the PSF first"},
+        "psfmodeluse":
+            {"type": str2bool, "default": False, "desc": "Use the fitted PSF model for galaxy fitting"},
+        "psfmodel":
             {"type": str, "default": "gaussian:1", "desc":
                 "PSF model description as comma-separated list of [profile]:[number];"
-                "only one profile type currently supported"}
-        , "optlib":    {"type": str,  "default": "scipy", "desc": "Optimization library", "values": optlibs}
-        , "algo":      {"type": str,  "default": None, "desc": "Optimization algorithm"}
-        , "grad":      {"type": str2bool, "default": False, "desc": "Use numerical gradient (pygmo)"}
-        , "galsim":    {"type": str2bool, "default": False, "desc": "Use galsim for modeling"}
-        , "useobj":    {"type": str2bool, "default": False, "desc": "Use pyprofit object interface"}
+                "only one profile type currently supported"},
+        "optlib":    {"type": str,  "default": "scipy", "desc": "Optimization library", "values": optlibs},
+        "algo":      {"type": str,  "default": None, "desc": "Optimization algorithm"},
+        "grad":      {"type": str2bool, "default": False, "desc": "Use numerical gradient (pygmo)"},
+        "galsim":    {"type": str2bool, "default": False, "desc": "Use galsim for modeling"},
+        "useobj":    {"type": str2bool, "default": False, "desc": "Use pyprofit object interface"},
     }
 
     for key, value in flags.items():
