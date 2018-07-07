@@ -4,7 +4,7 @@ import inspect
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-import pickle
+import time
 
 import pyprofit.python.objects as proobj
 import pyprofit.python.util as proutil
@@ -47,7 +47,7 @@ def modelpoissonsample(exposuresbyband, backgroundsbyband):
 
 
 # TODO: Make this a member function of model?
-def modelnormalize(model):
+def modelrescale(model, fluxnew=1.0):
     fluxparams = [param for param in model.getparameters() if isinstance(param, proobj.FluxParameter) and
                   not param.isfluxratio]
     fluxtotal = {}
@@ -57,7 +57,7 @@ def modelnormalize(model):
             fluxtotal[band] = 0.
         fluxtotal[band] += param.getvalue(transformed=False)
     for param in fluxparams:
-        param.setvalue(param.getvalue(transformed=False)/fluxtotal[param.band])
+        param.setvalue(fluxnew*param.getvalue(transformed=False)/fluxtotal[param.band])
 
 
 def setpsf(model, psf, usemodel=True):
@@ -84,15 +84,26 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
     if psf is not None:
         if psfname is None:
             psfname = ""
-        if psfmodel is not None:
+        if psfmodel is None:
             psfmodelname = ""
+    else:
+        psfname = None
+        psfmodelname = None
 
+    modelinits = {
+        modeltype: [param.getvalue(transformed=True)
+                    for param in model.getparameters()]
+        for modeltype, model in models.items()
+    }
+
+    paramsbytypecount = len(paramsbymodeltype)
+    modelscount = len(models)
     # The true model
-    for modeltype, paramsoftype in paramsbymodeltype.items():
+    for modeli, (modeltype, paramsoftype) in enumerate(paramsbymodeltype.items()):
         model = models[modeltype]
-
+        paramscount = len(paramsoftype)
         # The model params
-        for params in paramsoftype:
+        for parami, params in enumerate(paramsoftype):
             # TODO: Add a check to the zip
             # Set params to the right values
             for dest, valuenew in zip(model.getparameters(), params):
@@ -103,10 +114,24 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
             modelpoissonsample(model.data.exposures.items(), backgroundsbyband)
             if psfmodel is not None:
                 setpsf(model, psfmodel, usemodel=psfmodelusemodel)
+            print("Object params:", params)
 
             # The model to fit
-            for modeltypefit, modelfit in models.items():
-                print("Fitting object={:s} with model={:s}".format(modeltype, modeltypefit))
+            for modelfiti, (modeltypefit, modelfit) in enumerate(models.items()):
+                logmsg = "Fitting object={:s} with model={:s}".format(modeltype, modeltypefit)
+                if psfname is not None:
+                    logmsg += " and PSF={:s}".format(psfname)
+                if psfmodelname is not None:
+                    logmsg += " and PSFmodel={:s}".format(psfmodelname)
+                logmsg += " [model {}/{} object {}/{} modelfit {}/{}]".format(
+                    modeli+1, paramsbytypecount, parami+1, paramscount, modelfiti+1, modelscount)
+                print(logmsg)
+                if modeltypefit == modeltype:
+                    paramsinit = params
+                else:
+                    paramsinit = modelinits[modeltypefit]
+                for dest, valuenew in zip(modelfit.getparameters(), paramsinit):
+                    dest.setvalue(valuenew, transformed=True)
                 modelfit.data = model.data
                 modelfit.engine = engine
                 modeller = proobj.Modeller(model=modelfit, modellib=optlib, modellibopts=optlibopts)
@@ -119,7 +144,10 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
                         #modelpsf.engine = "libprofit"
                         engineold = modelfit.engineopts
                         modelfit.engineopts = engineoptsgsreal
-                result = modeller.fit(printsteps=printsteps, printfinal=True, timing=timing)
+                try:
+                    result = modeller.fit(printsteps=printsteps, printfinal=True, timing=timing)
+                except Exception as e:
+                    result = {"paramsbest": None, "time": None}
                 if plot:
                     modeller.evaluate(plot=True)
                     title = "Source={} Model={}".format(modeltype, modeltypefit)
@@ -134,7 +162,15 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
                     if "moffat" in modeltypefit:
                         #modelpsf.engine = engineold
                         modelfit.engineopts = engineold
-                result = {"fitresult": result, "fitinfo": modeller.fitinfo}
+                result = {
+                    "params": params,
+                    "paramsbest": result["paramsbest"],
+                    "modeltype": modeltype,
+                    "modeltypefit": modeltypefit,
+                    "psfname": psfname,
+                    "psfmodelname": psfmodelname,
+                    "time": result["time"],
+                }
                 results.append(result)
     return results
 
@@ -145,6 +181,7 @@ def gettestfittingmodels(
     psfradii=options["psfradii"]["default"], psfaxrats=options["psfaxrats"]["default"],
     imagesizes=options["imagesizes"]["default"], galaxyfluxes=options["galaxyfluxes"]["default"],
     galaxyfluxmults=options["galaxyfluxmults"]["default"], galaxyradii=options["galaxyradii"]["default"],
+    minimalmodels=False
 ):
     inputs = [backgrounds, psfsizes, psffluxes, psfradii, psfaxrats, imagesizes, galaxyfluxes]
     inputsreal = [all(np.isreal(x)) for x in inputs]
@@ -169,80 +206,142 @@ def gettestfittingmodels(
     psfsizes = [[i, i] for i in psfsizes][0]
     imagesizes = [[i, i] for i in imagesizes][0]
 
-    fluxesbyband1 = {band: 1. for band in bands}
-    fluxesbyband2 = {band: 0.5 for band in bands}
+    fluxesbyband = {i[0]: i[1] for i in zip(bands, psffluxes)}
     angles = np.repeat(90.0, bandscount)
+    # Note: The ratio of radii in the double Gaussian produces a PSF with nearly the same R50 (not FWHM)
     modelspsf = {
-        "gaussian:1": proutil.getmodel(fluxesbyband1, "gaussian:1", psfsizes, psfradii, psfaxrats,
+        "gaussian:1": proutil.getmodel(fluxesbyband, "gaussian:1", psfsizes, psfradii, psfaxrats,
                                        np.repeat(90.0, bandscount)),
-        "gaussian:2": proutil.getmodel(fluxesbyband2, "gaussian:2", psfsizes,
-                                       np.concatenate((psfradii*1.5, psfradii*0.725)),
-                                       np.concatenate((psfaxrats, psfaxrats)),
-                                       np.concatenate((angles, angles))),
-        "moffat:1":   proutil.getmodel(fluxesbyband1, "moffat:1", psfsizes, psfradii, psfaxrats, angles,
-                                       slopes=np.repeat(2.5, bandscount))
     }
-    modelspsf = {"gaussian:1": modelspsf["gaussian:1"]}
+    if not minimalmodels:
+        modelspsf["gaussian:2"] = proutil.getmodel(
+            fluxesbyband, "gaussian:2", psfsizes,
+            np.concatenate((psfradii * 1.5, psfradii * 0.725)),
+            np.concatenate((psfaxrats, psfaxrats)),
+            np.concatenate((angles, angles)))
+        modelspsf["moffat:1"] = proutil.getmodel(
+            fluxesbyband, "moffat:1", psfsizes, psfradii, psfaxrats,
+            angles, slopes=np.repeat(2.5, bandscount))
+
     psfs = {model: [] for model in modelspsf}
 
-    fluxesbyband1 = {i[0]: i[1] for i in zip(bands, psffluxes)}
-    fluxesbyband2 = {i[0]: np.repeat(i[1] / 2.0, 2) for i in zip(bands, psffluxes)}
     # TODO: Is this really easier than just changing the value(s) of the relevant parameters?
     # It's definitely not faster...
-    for angle in np.linspace(0., 45., 10):
+    for angle in np.linspace(0., 45., 2 + 2*(not minimalmodels)):
         angles = np.repeat(angle, bandscount)
         model = "gaussian:1"
         psfs[model].append(getparamvalues(proutil.getmodel(
-            fluxesbyband1, model, psfsizes, psfradii, psfaxrats, angles, nexposures=0)))
+            fluxesbyband, model, psfsizes, psfradii, psfaxrats, angles, nexposures=0)))
         model = "gaussian:2"
         if model in modelspsf:
             psfs[model].append(getparamvalues(proutil.getmodel(
-                fluxesbyband2, model, psfsizes, np.concatenate((psfradii*2., psfradii*0.5)),
+                fluxesbyband, model, psfsizes, np.concatenate((psfradii*2., psfradii*0.5)),
                 np.concatenate((psfaxrats, psfaxrats)), np.concatenate((angles, angles)), nexposures=0)))
-        # single Moffat with nomin*al 2.5 slope
+        # single Moffat with nominal 2.5 slope
         model = "moffat:1"
         if model in modelspsf:
             psfs[model].append(getparamvalues(proutil.getmodel(
-                fluxesbyband1, model, psfsizes, psfradii, psfaxrats, angles, slopes=np.repeat(2.5, bandscount),
+                fluxesbyband, model, psfsizes, psfradii, psfaxrats, angles, slopes=np.repeat(2.5, bandscount),
                 nexposures=0)))
 
     galaxyfluxes = np.array(galaxyfluxes)
     galaxyradii = np.array(galaxyradii)
     galaxyfluxmults = np.array(galaxyfluxmults)
 
-    fluxesbyband1 = {band: 1. for band in bands}
+    fluxesbyband = {i[0]: i[1] for i in zip(bands, galaxyfluxes)}
     models = {
-        "sersic:1": proutil.getmodel(fluxesbyband1, "sersic:1", imagesizes, np.repeat(5., bandscount),
-                                     np.repeat(0.5, bandscount), angles, slopes=np.repeat(2., bandscount))
+        "sersic:1": proutil.getmodel(fluxesbyband, "sersic:1", imagesizes, np.repeat(5., bandscount),
+                                     np.repeat(0.5, bandscount), angles, slopes=np.repeat(2., bandscount)),
     }
+    if not minimalmodels:
+        models["expser"] = proutil.getmodel(
+            fluxesbyband, "sersic:2", imagesizes,
+            np.concatenate((np.repeat(5., bandscount),
+                            np.repeat(2., bandscount))),
+            np.concatenate((np.repeat(0.5, bandscount),
+                            np.repeat(0.9, bandscount))),
+            np.concatenate((angles, angles)),
+            slopes=np.concatenate((np.repeat(1., bandscount),
+                                   np.repeat(4., bandscount))),
+            fluxfracs=np.concatenate((np.repeat(0.95, bandscount),
+                                   np.repeat(0.05, bandscount))),
+        )
+
+    for component in models["expser"].sources[0].modelphotometric.components:
+        component.parameters["nser"].fixed = True
+
     galaxies = {model: [] for model in models}
 
     # See Cortese et al. 2016 (or modify to suit your taste)
     diskheightratio = 0.2
-    bulgeheightratios = np.array([0.4, 0.6, 0.8, 1.0])
+    if minimalmodels:
+        bulgeheightratios = np.array([0.5, 1.0])
+        cosis = np.linspace(0., 1., 3)
+    else:
+        bulgeheightratios = np.array([0.4, 0.7, 1.0])
+        cosis = np.linspace(0., 1., 5)
+    sersicnbulges = [4.] if minimalmodels else [2., 4.]
+    bulgefracs = [0.5] if minimalmodels else [0.2, 0.5, 0.8]
+    sersicndisks = [1.] if minimalmodels else [0.5, 1.0, 2.]
+    angles = np.linspace(0., 45., 2 + 2*(not minimalmodels))
+    if minimalmodels:
+        angles = np.concatenate(angles, angles+90.)
     for fluxmult in galaxyfluxmults:
         fluxesbyband1 = {i[0]: fluxmult*i[1] for i in zip(bands, galaxyfluxes)}
         for radius in galaxyradii:
             radii = np.repeat(radius, bandscount)
-            for angle in np.linspace(0., 180., 10):
-                angles = np.repeat(angle, bandscount)
-                for cosi in np.linspace(0., 1., 10):
-                    model = "sersic:1"
-                    # See Cortese et al. 2016 eqn. (5)
-                    axrat = np.sqrt((cosi * (1-diskheightratio**2))**2 + diskheightratio**2)
-                    # exponential disk
-                    galaxies[model].append(getparamvalues(proutil.getmodel(
-                        fluxesbyband1, "sersic:1", imagesizes, radii, np.repeat(axrat, bandscount),
-                        angles, slopes=np.repeat(1., bandscount), nexposures=0)))
-                    # Sersic bulge
-                    axrats = np.unique(np.sqrt((cosi * (1.-bulgeheightratios**2))**2 + bulgeheightratios**2))
+            for angle in angles:
+                anglesinit = np.repeat(angle, bandscount)
+                model = "sersic:1"
+                # See Cortese et al. 2016 eqn. (5)
+                axrats = np.sqrt((cosis * (1-diskheightratio**2))**2 + diskheightratio**2)
+                if "sersic:1" in models:
+                    # Pure exponential disk galaxy
                     for axrat in axrats:
-                        for nser in [2., 3., 4.]:
-                            galaxies[model].append(getparamvalues(proutil.getmodel(
-                                fluxesbyband1, "sersic:1", imagesizes, radii, np.repeat(axrat, bandscount),
-                                angles, slopes=np.repeat(nser, bandscount), nexposures=0)))
-                    # exp + dev
-                    # double Sersic
+                        galaxies[model].append(getparamvalues(proutil.getmodel(
+                            fluxesbyband1, "sersic:1", imagesizes, radii, np.repeat(axrat, bandscount),
+                            anglesinit, slopes=np.repeat(1., bandscount), nexposures=0)))
+                    if not minimalmodels:
+                        # Sersic bulge (elliptical-like galaxy)
+                        axrats = set()
+                        for cosi in cosis:
+                            for heightratio in bulgeheightratios:
+                                axrats.add(np.sqrt((cosi * (1.-heightratio**2))**2 + heightratio**2))
+                        for axrat in axrats:
+                            for sersicn in sersicnbulges:
+                                galaxies[model].append(getparamvalues(proutil.getmodel(
+                                    fluxesbyband1, "sersic:1", imagesizes, radii, np.repeat(axrat, bandscount),
+                                    anglesinit, slopes=np.repeat(sersicn, bandscount), nexposures=0)))
+                if "expser" in models and not minimalmodels:
+                    model = "expser"
+                    axrats = np.sqrt((cosis * (1 - diskheightratio ** 2)) ** 2 + diskheightratio ** 2)
+                    for axrat in axrats:
+                        for bulgefrac in bulgefracs:
+                            for sersicndisk in sersicndisks:
+                                for sersicnbulge in sersicnbulges:
+                                    galaxies[model].append(getparamvalues(proutil.getmodel(
+                                        fluxesbyband1, "sersic:2", imagesizes,
+                                        np.concatenate((np.repeat(1.2*radius, bandscount),
+                                                        np.repeat(0.4*radius, bandscount))),
+                                        np.concatenate((np.repeat(axrat, bandscount),
+                                                        np.repeat(1., bandscount))),
+                                        np.concatenate((angles, angles)),
+                                        slopes=np.concatenate((
+                                            np.repeat(sersicndisk, bandscount),
+                                            np.repeat(sersicnbulge, bandscount))),
+                                        fluxfracs=np.concatenate((
+                                            np.repeat(1.-bulgefrac, bandscount),
+                                            np.repeat(1.-bulgefrac, bandscount))),
+                                        nexposures=0)))
+
+
+                # exp + dev
+                # double Sersic
+
+    print("Returning {} models and {} PSFs to test".format(
+        sum(len(galaxies[model]) for model in galaxies),
+        sum(len(psfs[model]) for model in psfs)
+    ))
 
     rv = {
         "backgroundsbyband": {band: background for band, background in zip(bands, backgrounds)},
@@ -276,6 +375,9 @@ if __name__ == '__main__':
         'optlibs':    {'type': str,   'nargs': '*', 'default': 'scipy', 'help': 'Optimization libraries'},
         'algos':      {'type': str,   'nargs': '*', 'default': 'L-BFGS-B', 'help': 'Optimization algorithms'},
         'engines':    {'type': str,   'nargs': '*', 'default': 'galsim', 'help': 'Model generation engines'},
+        'plot':       {'type': proutil.str2bool, 'default': False, 'help': 'Toggle plotting of final fits'},
+        'fileout':    {'type': str,   'nargs': '?', 'default': None, 'help': 'File prefix to output results'},
+        'seed':       {'type': int,   'nargs': '?', 'default': 1, 'help': 'Numpy random seed'}
     }
 
     for key, value in flags.items():
@@ -290,46 +392,76 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     argvars = vars(args)
-    optvars = ["optlibs", "algos", "engines"]
+    fileout = args.fileout
+    seed = args.seed
+    optvars = ["optlibs", "algos", "engines", "plot"]
     testargs = {key: [argvars[key]] if isinstance(argvars[key], str) else argvars[key] for key in optvars}
     # TODO: Need a dict/method to get algorithm name for given optlib
     # testargs["optlibswithopts"] = {optlib: {"algo": testargs["algos"]} for optlib in testargs["optlibs"]}
     # testargs["engineswithopts"] = {engine: None for engine in testargs["engines"]}
     for optvar in optvars:
         del argvars[optvar]
+    for var in ['fileout', 'seed']:
+        del argvars[var]
 
     fitmodels = gettestfittingmodels(**argvars)
-    psffitsall = []
+
+    write = fileout is not None
 
     psfs = copy.deepcopy(fitmodels["modelspsf"])
+    # The actual PSF
     for psftype, paramspsfs in fitmodels["psfs"].items():
-        for paramspsf in paramspsfs:
+        for psfi, paramspsf in enumerate(paramspsfs):
+            np.random.seed(seed)
             psffits = testfitting(fitmodels["modelspsf"], {psftype: [paramspsf]},
                                   backgroundsbyband=fitmodels["backgroundsbyband"], engine="galsim",
                                   optlib=options["psfoptlib"]["default"], optlibopts={"algo": "neldermead"},
-                                  printsteps=100)
-            galfitsall = []
+                                  printsteps=None)
+            seed = seed + 1
+            galfitsall = {}
             psf = psfs[psftype]
             for dest, valuenew in zip(psf.getparameters(), paramspsf):
                 dest.setvalue(valuenew, transformed=True)
-            modelnormalize(psf)
-            # Note: conveniently, the fitmodels already have the best-fit values stored
-            for psfmodel in [None] + list(fitmodels["psfs"].values()):
+            modelrescale(psf)
+            # The PSF to use
+            psfmodels = [None] + psffits
+            for psfmodel in psfmodels:
+                np.random.seed(seed)
                 if psfmodel is None:
                     psffit = fitmodels["modelspsf"][psftype]
+                    psfmodelname = ""
                 else:
-                    psffit = psfmodel
-                    modelnormalize(psffit)
+                    psffit = fitmodels["modelspsf"][psfmodel["modeltype"]]
+                    psfmodelname = psfmodel["modeltype"]
+                    # Note: conveniently, the fitmodels already have the best-fit values stored
+                    #for dest, valuenew in zip(psffit.getparameters(fixed=False), psfmodel["fitresult"][0]):
+                    #    dest.setvalue(valuenew, transformed=True)
+                    modelrescale(psffit)
                 for engine in testargs["engines"]:
                     galfits = testfitting(fitmodels["models"], fitmodels["galaxies"],
                                           backgroundsbyband=fitmodels["backgroundsbyband"],
                                           psf=psf, psfusemodel=True, psfname=psftype,
-                                          psfmodel=psffit, psfmodelusemodel=psfmodel is not None,
+                                          psfmodel=psffit, psfmodelname=psfmodelname,
+                                          psfmodelusemodel=psfmodel is not None,
                                           engine=engine,
                                           optlib=options["psfoptlib"]["default"],
                                           optlibopts={"algo": "neldermead"},
-                                          printsteps=200, plot=False)
-                    galfitsall.append(galfits)
-            psffitsall.append((psffits,galfitsall))
+                                          plot=testargs["plot"], printsteps=None,
+                                          )
+                    if write:
+                        galfitsall[engine] = galfits
+                if write:
+                    data = {
+                        "fitmodels": fitmodels,
+                        "galfits": galfitsall,
+                        "psfmodel": psfmodel,
+                        "psfname": psftype,
+                        "psfmodelname": psfmodelname,
+                        "seed": seed,
+                    }
 
-    pickle.dump(psffitsall, file=os.path.expanduser("~/pyprofit.pickle.dat"))
+                    import _pickle as pickle
+                    filepsf = "_".join(fileout, psftype, psfi, psfmodelname) + ".dat"
+                    with open(os.path.expanduser(filepsf), 'wb') as f:
+                        pickle.dump(data, f)
+                seed = seed + 1
