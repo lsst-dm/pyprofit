@@ -26,6 +26,15 @@ def allequal(iterator):
 # way you could give a model some exposures with WCS and it would automagically convert to pixel coordinates.
 
 
+# TODO: Make this a class
+def getgsparams(engineopts):
+    if engineopts is None:
+        gsparams = gs.GSParams()
+    else:
+        gsparams = engineopts["gsparams"]
+    return gsparams
+
+
 class Exposure:
     """
         A class to hold an image, sigma map, bad pixel mask and reference to a PSF model/image
@@ -97,7 +106,7 @@ class PSF:
         return self.image.shape
 
     # TODO: support rescaling of the PSF if it's a galsim interpolatedimage?
-    def getimage(self, engine=None, size=None):
+    def getimage(self, engine=None, size=None, engineopts=None):
         if engine is None:
             engine = self.engine
         if size is None and self.model is None:
@@ -122,7 +131,8 @@ class PSF:
         # TODO: There's more torturous logic here if we're to support changing engines on the fly
         if engine != self.engine:
             if engine == "galsim":
-                self.image = gs.InterpolatedImage(gs.ImageD(self.image, scale=1))
+                gsparams = getgsparams(engineopts)
+                self.image = gs.InterpolatedImage(gs.ImageD(self.image, scale=1), gsparams=gsparams)
             else:
                 if self.engine == "galsim":
                     self.image = self.image.image.array
@@ -214,7 +224,7 @@ class Model:
         for band in bands:
             # TODO: Check band
             for exposure in data.exposures[band]:
-                image = self.getexposuremodel(exposure, engine=engine)
+                image = self.getexposuremodel(exposure, engine=engine, engineopts=engineopts)
                 if keepimages:
                     exposure.meta["modelimage"] = np.array(image)
                 if getlikelihood or plot:
@@ -307,8 +317,6 @@ class Model:
         nx, ny = exposure.image.shape
         band = exposure.band
         profiles = self.getprofiles([band], engine=engine)
-#        for bandprofiles in self.getprofiles([band], engine=engine):
-#            profiles += bandprofiles[band]
 
         haspsf = exposure.psf is not None
         allgaussian = haspsf and exposure.psf.model is not None and \
@@ -350,7 +358,7 @@ class Model:
                 shape = exposure.psf.getimageshape()
                 if shape is None:
                     shape = [1 + np.int(x/2) for x in np.floor([nx, ny])]
-                profit_model["psf"] = exposure.psf.getimage(engine, size=shape)
+                profit_model["psf"] = exposure.psf.getimage(engine, size=shape, engineopts=engineopts)
 
             if exposure.calcinvmask is not None:
                 profit_model['calcmask'] = exposure.calcinvmask
@@ -377,6 +385,7 @@ class Model:
                 else:
                     profilesgs[convolve] += profilegs
 
+            gsparams = getgsparams(engineopts)
             if haspsf:
                 psfgs = exposure.psf.model
                 if psfgs is None:
@@ -393,7 +402,7 @@ class Model:
                             profilespsf = profilegs
                         else:
                             profilespsf += profilegs
-                profilesgs[True] = gs.Convolve(profilesgs[True], profilespsf)
+                profilesgs[True] = gs.Convolve(profilesgs[True], profilespsf, gsparams=gsparams)
             else:
                 if profilesgs[True] is not None:
                     raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
@@ -445,13 +454,15 @@ class Model:
         params = self.getparameters(free=free, fixed=fixed)
         return [param.getlimits(transformed=transformed) for param in params]
 
-    def getprofiles(self, bands, engine=None):
+    def getprofiles(self, bands, engine=None, engineopts=None):
         if engine is None:
             engine = self.engine
+        if engineopts is None:
+            engineopts = self.engineopts
         self._checkengine(engine)
         profiles = []
         for src in self.sources:
-            profiles += src.getprofiles(engine=engine, bands=bands)
+            profiles += src.getprofiles(engine=engine, bands=bands, engineopts=engineopts)
         return profiles
 
     def getparameters(self, free=True, fixed=True):
@@ -717,10 +728,11 @@ class Source:
         return self.modelastrometric.getparamnames(free, fixed) + \
             self.modelphotometric.getparameters(free, fixed)
 
-    def getprofiles(self, engine, bands, time=None):
+    def getprofiles(self, engine, bands, time=None, engineopts=None):
         self._checkengine(engine)
         cenx, ceny = self.modelastrometric.getposition(time=time)
-        return self.modelphotometric.getprofiles(engine=engine, bands=bands, cenx=cenx, ceny=ceny, time=time)
+        return self.modelphotometric.getprofiles(engine=engine, bands=bands, cenx=cenx, ceny=ceny, time=time,
+                                                 engineopts=engineopts)
 
     def __init__(self, modelastrometry, modelphotometry, name=""):
         self.name = name
@@ -736,11 +748,12 @@ class PhotometricModel:
             params += comp.getparameters(free=free, fixed=fixed)
         return params
 
-    def getprofiles(self, engine, bands, cenx, ceny, time=None):
+    def getprofiles(self, engine, bands, cenx, ceny, time=None, engineopts=None):
         # TODO: Check if this should skip entirely instead of adding a None for non-included bands
         bandfluxes = {band: self.fluxes[band].getvalue(transformed=False) if
                       band in self.fluxes else None for band in bands}
-        return [comp.getprofiles(bandfluxes, engine, cenx, ceny) for comp in self.components]
+        return [comp.getprofiles(bandfluxes, engine, cenx, ceny, engineopts=engineopts) for comp in
+                self.components]
 
     def __init__(self, components, fluxes=[]):
         for i, comp in enumerate(components):
@@ -810,7 +823,7 @@ class Component(object, metaclass=ABCMeta):
     optional = ["cenx", "ceny"]
 
     @abstractmethod
-    def getprofiles(self, bandfluxes, engine, cenx, ceny):
+    def getprofiles(self, bandfluxes, engine, cenx, ceny, engineopts=None):
         """
             bandfluxes is a dict of bands with item flux in a linear scale or None if components independent
             Return is dict keyed by band with lists of engine-dependent profiles.
@@ -870,7 +883,7 @@ class EllipticalProfile(Component):
             [value for value in self.parameters.values() if \
                 (value.fixed and fixed) or (not value.fixed and free)]
 
-    def getprofiles(self, bandfluxes, engine, cenx, ceny):
+    def getprofiles(self, bandfluxes, engine, cenx, ceny, engineopts=None):
         self._checkengine(engine)
         isgaussian = self.isgaussian()
 
@@ -913,28 +926,30 @@ class EllipticalProfile(Component):
                 if engine == "galsim":
                     axrat = profile["axrat"]
                     axratsqrt = np.sqrt(axrat)
+                    gsparams = getgsparams(engineopts)
                     if isgaussian:
                         if self.profile == "sersic":
                             fwhm = 2.*profile["re"]
                         else:
                             fwhm = profile["fwhm"]
                         profilegs = gs.Gaussian(
-                            fwhm=fwhm*axratsqrt, flux=flux
+                            flux=flux, fwhm=fwhm*axratsqrt,
+                            gsparams=gsparams
                         )
                     elif self.profile == "sersic":
                         if profile["nser"] < 0.3 or profile["nser"] > 6.2:
                             print("Warning: Sersic n {:.3f} not >= 0.3 and <= 6.2; "
                                   "GalSim could fail.".format(profile["nser"]))
                         profilegs = gs.Sersic(
-                            n=profile["nser"],
+                            flux=flux, n=profile["nser"],
                             half_light_radius=profile["re"]*axratsqrt,
-                            flux=flux
+                            gsparams=gsparams
                         )
                     elif self.profile == "moffat":
                         profilegs = gs.Moffat(
-                            beta=profile["con"],
+                            flux=flux, beta=profile["con"],
                             fwhm=profile["fwhm"]*axratsqrt,
-                            flux=flux
+                            gsparams=gsparams
                         )
                     profile = {
                         "profile": profilegs,

@@ -1,5 +1,6 @@
 import argparse
 import copy
+import galsim as gs
 import inspect
 import matplotlib.pyplot as plt
 import numpy as np
@@ -79,7 +80,6 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
                 engine=options["engines"]["default"], optlib=options["optlibs"]["default"][0],
                 optlibopts=None, plot=False, printsteps=None, timing=False,
                 psfname=None, psfmodelname=None):
-    engineoptsgsreal = {"drawmethod": "real_space"}
     results = []
     if psf is not None:
         if psfname is None:
@@ -89,6 +89,11 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
     else:
         psfname = None
         psfmodelname = None
+
+    if engine == "galsim":
+        engineopts = {"gsparams": gs.GSParams(maximum_fft_size=8192*2)}
+        engineoptsgsreal = {"drawmethod": "real_space"}
+        engineoptsgsreal.update(engineopts)
 
     modelinits = {
         modeltype: [param.getvalue(transformed=True)
@@ -144,10 +149,15 @@ def testfitting(models, paramsbymodeltype, psf=None, psfusemodel=False, psfmodel
                         #modelpsf.engine = "libprofit"
                         engineold = modelfit.engineopts
                         modelfit.engineopts = engineoptsgsreal
+                    else:
+                        modelfit.engineopts = engineopts
+                timefit = time.time()
                 try:
                     result = modeller.fit(printsteps=printsteps, printfinal=True, timing=timing)
                 except Exception as e:
-                    result = {"paramsbest": None, "time": None}
+                    timefit = time.time() - timefit
+                    result = {"paramsbest": None, "time": timefit}
+                    print("Fitting failed after t={:.1e} with exception: ".format(timefit), e)
                 if plot:
                     modeller.evaluate(plot=True)
                     title = "Source={} Model={}".format(modeltype, modeltypefit)
@@ -456,12 +466,13 @@ if __name__ == '__main__':
                         "galfits": galfitsall,
                         "psfmodel": psfmodel,
                         "psfname": psftype,
+                        "psf": psf,
                         "psfmodelname": psfmodelname,
                         "seed": seed,
                     }
 
                     import _pickle as pickle
-                    filepsf = "_".join(fileout, psftype, psfi, psfmodelname) + ".dat"
+                    filepsf = "_".join([fileout, psftype, str(psfi), psfmodelname]) + ".dat"
                     with open(os.path.expanduser(filepsf), 'wb') as f:
                         pickle.dump(data, f)
                 seed = seed + 1
