@@ -16,6 +16,7 @@ from skimage import measure
 import subprocess
 from subprocess import PIPE
 from scipy import stats
+import sys
 
 algos_lib_default = {"scipy": "L-BFGS-B", "pygmo": "lbfgs"}
 optlibs = ["pygmo", "scipy"]
@@ -230,15 +231,21 @@ def gethsc(bands, ra, dec, prefix=None, **kwargs):
 
         # Read the mask - it's not a segmentation map, but we can at least select all contiguous "detected"
         # pixels assuming the object is in the center
-        invmask = fitsio.read(fitsband, ext=extensions["mask"])
-        headermask = fitsio.read_header(fitsband, ext=extensions["mask"])
+        fitsmask = "_".join(prefixband) + "_maskinverse.fits"
+        if os.path.isfile(fitsmask):
+            invmask = fitsio.read(fitsmask)
+            invmask = invmask > 0
+        else:
+            invmask = fitsio.read(fitsband, ext=extensions["mask"])
+            headermask = fitsio.read_header(fitsband, ext=extensions["mask"])
+            # Bright objects that are not saturated and should be safe to use
+            brightflag = 2 ** headermask["MP_BRIGHT_OBJECT"]
+            # detected = 2**headermask["MP_DETECTED"]
+            # This will also select blended sources, but it's the best you can do with no segmentation map
+            segments = measure.label(invmask, background=0)
+            invmask = 1 * (segments == segments[cen[0], cen[1]]) | 1 * (invmask == 0) | 1 * (
+                        invmask == brightflag) != 0
         cen = [np.int(np.floor(x/2.0)) for x in invmask.shape]
-        # Bright objects that are not saturated and should be safe to use
-        brightflag = 2**headermask["MP_BRIGHT_OBJECT"]
-        # detected = 2**headermask["MP_DETECTED"]
-        # This will also select blended sources, but it's the best you can do with no segmentation map
-        segments = measure.label(invmask, background=0)
-        invmask = 1*(segments == segments[cen[0], cen[1]]) | 1*(invmask == 0) | 1*(invmask == brightflag) != 0
         # The scaling below will get it into maggies
         variance = fitsio.read(fitsband, ext=extensions["variance"])
 
@@ -279,7 +286,7 @@ def str2bool(v):
 
 def testhsc(radec=None, bands=None, size=None, psffit=False, model="sersic:1", psfmodel=None,
             psfmodeluse=False, optlib="scipy", algo=None, grad=False, galsim=False, useobj=False,
-            paramsinit=None):
+            paramsinit=None, plot=False):
     if algo is None:
         algo = algos_lib_default[optlib]
     engine = None
@@ -647,6 +654,8 @@ def testhsc(radec=None, bands=None, size=None, psffit=False, model="sersic:1", p
                 for dest, target in zip(paramsinit, params):
                     target.setvalue(dest, transformed=True)
             modeller = proobj.Modeller(model, modellib=optlib, modellibopts={"algo": algo})
+            if plot:
+                modeller.evaluate(plot=True)
             modeller.fit(printfinal=True, printsteps=100)
         else:
             # Initial parameter guess - ellipses can be done better
@@ -704,6 +713,7 @@ if __name__ == '__main__':
         "galsim":    {"type": str2bool, "default": False, "desc": "Use galsim for modeling"},
         "useobj":    {"type": str2bool, "default": False, "desc": "Use pyprofit object interface"},
         "paramsinit":      {"type": str, "default": None, "desc": "Initial fit parameters"},
+        "plot": {"type": str2bool, "default": False, "desc": "Make initial/final model plots"},
     }
 
     for key, value in flags.items():
