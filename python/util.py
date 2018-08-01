@@ -105,7 +105,7 @@ def getparamdefault(param, value=None, profile=None, fixed=False):
 
 def getmodel(
     fluxesbyband, modelstr, imagesize, sizes, axrats, angs, slopes=None, fluxfracs=None,
-    offsetxy=None, name="", nexposures=1, engine="galsim"
+    offsetxy=None, name="", nexposures=1, engine="galsim", engineopts=None
 ):
     bands = fluxesbyband.keys()
     modelstrs = modelstr.split(",")
@@ -163,16 +163,26 @@ def getmodel(
     for profile, nprofiles in profiles.items():
         comprange = range(compnum, compnum + nprofiles)
         isgaussian = profile == "gaussian"
+        ismultigaussiansersic = profile == "multigaussiansersic"
+        issoftened = profile == "lux" or profile == "luv"
         if isgaussian:
             profile = "sersic"
             for compi in comprange:
                 sizes[compi] /= 2.
+        if ismultigaussiansersic:
+            profile = "sersic"
         values = {
             "size": sizes,
-            "slope": slopes,
             "axrat": axrats,
             "ang": angs,
         }
+        # TODO: The implementation of MultiGaussian should have a list of supported slopes
+        if ismultigaussiansersic:
+            if any([not (x == 1 or x == 4) for x in slopes]):
+                raise ValueError("Requested {} profile from getmodel but specified "
+                                 "slopes {} not all in [1,4]".format(profile, slopes))
+        if not issoftened:
+            values["slope"] = slopes
 
         for compi in comprange:
             islast = compi == (ncomps - 1)
@@ -183,9 +193,14 @@ def getmodel(
                 for band in bands
             ]
             params = [getparamdefault(param, valueslice[compi], profile,
-                                      fixed=isgaussian and param == "slope")
+                                      fixed=param == "slope" and (isgaussian or ismultigaussiansersic))
                       for param, valueslice in values.items()]
-            components.append(proobj.EllipticalProfile(paramfluxescomp, profile=profile, parameters=params))
+            if ismultigaussiansersic or issoftened:
+                components.append(proobj.MultiGaussianApproximationProfile(
+                    paramfluxescomp, profile=profile, parameters=params))
+            else:
+                components.append(proobj.EllipticalProfile(
+                    paramfluxescomp, profile=profile, parameters=params))
 
         compnum += ncomps
 
@@ -197,5 +212,5 @@ def getmodel(
     ]
     modelphoto = proobj.PhotometricModel(components, paramfluxes)
     source = proobj.Source(modelastro, modelphoto, name)
-    model = proobj.Model([source], data, engine=engine)
+    model = proobj.Model([source], data, engine=engine, engineopts=engineopts)
     return model

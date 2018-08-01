@@ -8,7 +8,11 @@ import pygmo as pg
 import pyprofit as pyp
 import scipy.stats as spstats
 import scipy.optimize as spopt
+import seaborn as sns
 import time
+
+#gaussian_sigma_to_fwhm = 2.35482004503094932701
+#gaussian_fwhm_to_sigma = 0.424660900144009534340
 
 
 # https://stackoverflow.com/questions/3844801/check-if-all-elements-in-a-list-are-identical
@@ -148,10 +152,15 @@ class PSF:
                 raise ValueError("PSF must be initialized with either a model or engine but both are none")
             if usemodel:
                 raise ValueError("PSF usemodel==True but no model specified")
-            if not isinstance(image, np.ndarray):
-                raise ValueError("PSF image must be an ndarray")
-            self.engine = "libprofit"
-            self.image = self.getimage(engine=engine)
+            if (engine == "galsim") and (isinstance(image, gs.InterpolatedImage) or
+                                         isinstance(image, gs.Image)):
+                self.engine = engine
+            else:
+                if not isinstance(image, np.ndarray):
+                    raise ValueError("PSF image must be an ndarray or galsim.Image/galsim.InterpolatedImage if "
+                                     "using galsim")
+                self.engine = "libprofit"
+                self.image = self.getimage(engine=engine)
         else:
             if image is not None:
                 raise ValueError("PSF initialized with a model cannot be initialized with an image as well")
@@ -215,12 +224,17 @@ class Model:
             plotslen = 0
             for band in bands:
                 plotslen += len(data.exposures[band])
-            figure, axes = plt.subplots(nrows=plotslen, ncols=5)
+            figure, axes = plt.subplots(nrows=plotslen + (plotslen == 3), ncols=5)
             if plotslen == 1:
                 axes.shape = (1, 5)
             figurerow = 0
         else:
             figaxes = None
+        chis = []
+        chiclips = []
+        chiimgs = []
+        imgclips = []
+        modelclips = []
         for band in bands:
             # TODO: Check band
             for exposure in data.exposures[band]:
@@ -231,8 +245,9 @@ class Model:
                     if plot:
                         figaxes = (figure, axes[figurerow])
                         figurerow += 1
-                    likelihoodexposure = self.getexposurelikelihood(
-                        exposure, image, log=likelihoodlog, figaxes=figaxes)
+                    likelihoodexposure, chi, chiimg, chiclip, imgclip, modelclip = \
+                        self.getexposurelikelihood(
+                            exposure, image, log=likelihoodlog, figaxes=figaxes)
                     if keeplikelihood:
                         exposure.meta["likelihood"] = likelihoodexposure
                         exposure.meta["likelihoodlog"] = likelihoodlog
@@ -240,10 +255,61 @@ class Model:
                         likelihood += likelihoodexposure
                     else:
                         likelihood *= likelihoodexposure
-
+                    if plot and plotslen == 3:
+                        chis.append(chi)
+                        chiclips.append(chiclip)
+                        chiimgs.append(chiimg)
+                        imgclips.append(imgclip)
+                        modelclips.append(modelclip)
+            # Color images! whooo
+        if plot:
+            if plotslen == 3:
+                self.plotexposurescolor(imgclips, modelclips, chis, chiimgs,
+                                        chiclips, (figure, axes[figurerow]))
+            plt.tight_layout()
+            plt.subplots_adjust(wspace=0.05, hspace=0.05)
         return likelihood, params
 
-    def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None, figaxes=None):
+    def plotexposurescolor(self, images, modelimages, chis, chiimgs, chiclips, figaxes):
+        # TODO: verify lengths
+        axes = figaxes[1]
+        shapeimg = images[0].shape
+        for i, imagesbytype in enumerate([images, modelimages]):
+            rgb = np.zeros(shapeimg + (0,))
+            for image in imagesbytype:
+                rgb = np.append(rgb, image.reshape(shapeimg + (1,)), axis=2)
+            axes[i].imshow(np.flip(rgb, axis=2), origin="bottom")
+        rgb = np.zeros(shapeimg + (0,))
+        for image in chiimgs:
+            rgb = np.append(rgb, image.reshape(shapeimg + (1,)), axis=2)
+        # The difference map
+        axes[2].imshow(np.flip(rgb, axis=2), origin="bottom")
+        # axes[2].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
+        # The chi (data-model)/error map clipped at +/- 5 sigma
+        rgb = np.zeros(shapeimg + (0,))
+        for image in chiclips:
+            rgb = np.append(rgb, image.reshape(shapeimg + (1,)), axis=2)
+        axes[3].imshow(np.flip(rgb, axis=2), origin="bottom")
+        # Residual histogram compared to a normal distribution
+        chi = np.array([])
+        for chiband in chis:
+            chi = np.append(chi, chiband)
+        nbins = np.max([100, np.int(np.round(np.sum(~np.isnan(chi))/300))])
+        sns.distplot(chi[~np.isnan(chi)], bins=nbins, ax=axes[4],
+                     hist_kws={"log": True, "histtype": "step"},
+                     kde_kws={"kernel": "tri", "gridsize": nbins/2}).set(
+            xlim=(-5, 5), ylim=(1e-4, 1)
+        )
+        # axes[4].hist(chi[~np.isnan(chi)], bins=100, log=True, density=True, histtype="step", fill=False)
+        x = np.linspace(-5., 5., int(1e4) + 1, endpoint=True)
+        axes[4].plot(x, spstats.norm.pdf(x))
+        chisqred = (np.sum(chi ** 2)/len(chi))
+        axes[4].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
+        for i in range(1, 5):
+            axes[i].set_yticklabels([])
+
+    def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None,
+                              figaxes=None, maximg=None, minimg=None):
         if likefunc is None:
             likefunc = self.likefunc
         hasmask = exposure.maskinverse is not None
@@ -253,37 +319,67 @@ class Model:
             ylist = np.arange(0, modelimage.shape[0])
             x, y = np.meshgrid(xlist, ylist)
             chi = (exposure.image - modelimage)
-            # The original image
-            axes[0].imshow(exposure.image, cmap='gray', norm=mpl.colors.LogNorm())
-            if hasmask:
-                z = exposure.maskinverse
-                axes[0].contour(x, y, z)
+            if maximg is None:
+                if hasmask:
+                    maximg = np.max([np.max(exposure.image[exposure.maskinverse]),
+                                     np.max(modelimage[exposure.maskinverse])])
+                else:
+                    maximg = np.max([np.max(exposure.image), np.max(modelimage)])
+            if minimg is None:
+                minimg = maximg/1e4
+            # The original image and model image
+            imgclips = []
+            for i, img in enumerate([exposure.image, modelimage]):
+                imgclip = (np.log10(np.clip(img, minimg, maximg)) - np.log10(minimg))/np.log10(maximg/minimg)
+                imgclips.append(imgclip)
+                axes[i].imshow(imgclip, cmap='gray', origin="bottom")
+                axes[i].set_xticklabels([])
+                if hasmask:
+                    z = exposure.maskinverse
+                    axes[i].contour(x, y, z)
             axes[0].set_title('Band={}'.format(exposure.band))
-            # The model
-            axes[1].imshow(modelimage, cmap='gray', norm=mpl.colors.LogNorm())
-            if hasmask:
-                axes[1].contour(x, y, z)
-            # The difference map
-            axes[2].imshow(chi, cmap='gray', norm=mpl.colors.LogNorm())
+            axes[1].set_title('Model'.format(exposure.band))
+            # The (logged) difference map
+            chilog = np.log10(np.clip(np.abs(chi), minimg, np.inf)/minimg)*np.sign(chi)
+            chilog /= np.log10(maximg/minimg)
+            chilog = np.clip((chilog+1.)/2., 0, 1)
+            axes[2].imshow(chilog, cmap='gray', origin='bottom')
             if hasmask:
                 axes[2].contour(x, y, z)
             # The chi (data-model)/error map clipped at +/- 5 sigma
             chi *= exposure.sigmainverse
-            chisqred = np.sum(chi**2)/np.prod(chi.shape)
-            axes[2].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
             chiclip = np.copy(chi)
             chiclip[chi < -5] = -5
             chiclip[chi > 5] = 5
-            axes[3].imshow(chiclip, cmap='gray', norm=mpl.colors.LogNorm())
             if hasmask:
-                figaxes[3].contour(x, y, z)
+                chi = chi[exposure.maskinverse]
+                chisqred = (np.sum(chi**2) /
+                            np.sum(exposure.maskinverse))
+            else:
+                chisqred = np.sum(chi**2) / np.prod(chi.shape)
+            axes[3].imshow(chiclip, cmap='RdYlBu_r', origin="bottom")
+            chiclip += 5.
+            chiclip /= 10.
+            if hasmask:
+                axes[3].contour(x, y, z, colors="green")
             # Residual histogram compared to a normal distribution
-            axes[4].hist(chi[~np.isnan(chi)], bins=100, log=True, density=True, histtype="step", fill=False)
-            plt.xlim(-5, 5)
-            plt.ylim(1e-4, 1)
+            nbins = np.max([100, np.int(np.round(np.sum(~np.isnan(chi))/300))])
+            sns.distplot(chi[~np.isnan(chi)], bins=nbins, ax=axes[4],
+                         hist_kws={"log": True, "histtype": "step"},
+                         kde_kws={"kernel": "tri", "gridsize": nbins/2}).set(
+                xlim=(-5, 5), ylim=(1e-4, 1)
+            )
+            # axes[4].hist(chi[~np.isnan(chi)], bins=100, log=True, density=True, histtype="step", fill=False)
             x = np.linspace(-5., 5., int(1e4) + 1, endpoint=True)
             axes[4].plot(x, spstats.norm.pdf(x))
+            axes[4].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
+            axes[4].yaxis.tick_right()
+            for i in range(1, 5):
+                axes[i].set_yticklabels([])
         else:
+            chilog = None
+            chiclip = None
+            imgclips = [None, None]
             if hasmask:
                 chi = (exposure.image[exposure.maskinverse] - modelimage[exposure.maskinverse]) * \
                     exposure.sigmainverse[exposure.maskinverse]
@@ -302,7 +398,8 @@ class Model:
         if not log:
             likelihood = np.exp(likelihood)
 
-        return likelihood
+        return likelihood, chi, chilog, chiclip, imgclips[0], imgclips[1]
+
 
     # TODO: Implement analytic Gaussian convolution
     def getexposuremodel(self, exposure, engine=None, engineopts=None):
@@ -314,7 +411,7 @@ class Model:
         if engineopts is None:
             engineopts = self.engineopts
         Model._checkengine(engine)
-        nx, ny = exposure.image.shape
+        ny, nx = exposure.image.shape
         band = exposure.band
         profiles = self.getprofiles([band], engine=engine)
 
@@ -341,6 +438,7 @@ class Model:
                         raise RuntimeError("libprofit can't handle non-point sources that aren't resolved"
                                            "(i.e. profiles with size==0)")
                 del profile["pointsource"]
+                del profile["resolved"]
                 # TODO: Find a better way to do this
                 for coord in ["x", "y"]:
                     nameold = "cen" + coord
@@ -427,7 +525,7 @@ class Model:
                             profilesgs = profilesgs[True]
                     else:
                         profilesgs = profilesgs[False]
-                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=1)
+
             except RuntimeError as e:
                 if method == "fft":
                     if haspsfimage:
@@ -455,6 +553,13 @@ class Model:
         return [param.getlimits(transformed=transformed) for param in params]
 
     def getprofiles(self, bands, engine=None, engineopts=None):
+        '''
+
+        :param bands: List of bands
+        :param engine: Valid engine
+        :param engineopts: Dict of engine options
+        :return: List of profiles
+        '''
         if engine is None:
             engine = self.engine
         if engineopts is None:
@@ -525,7 +630,7 @@ class ModellerPygmoUDP:
         return self.boundslower, self.boundsupper
 
     def gradient(self, x):
-        return pg.estimate_gradient(lambda y: self.fitness(y), x)
+        return pg.estimate_gradient(self.fitness, x)
 
     def __init__(self, modeller, boundslower, boundsupper, timing=False):
         self.modeller = modeller
@@ -587,8 +692,10 @@ class Modeller:
         if timing:
             loginfo["time"] = tstep
             loginfo["tinit"] = tinit
-        self.fitinfo["log"].append(loginfo)
-        if self.fitinfo["printsteps"] is not None:
+        if "log" in self.fitinfo:
+            self.fitinfo["log"].append(loginfo)
+        if ("printsteps" in self.fitinfo and
+                self.fitinfo["printsteps"] is not None):
             stepnum = len(self.fitinfo["log"])
             if stepnum % self.fitinfo["printsteps"] == 0:
                 print(stepnum, rv, loginfo)
@@ -749,11 +856,23 @@ class PhotometricModel:
         return params
 
     def getprofiles(self, engine, bands, cenx, ceny, time=None, engineopts=None):
+        '''
+
+        :param engine:
+        :param bands:
+        :param cenx:
+        :param ceny:
+        :param time:
+        :param engineopts:
+        :return: List of dicts by band
+        '''
         # TODO: Check if this should skip entirely instead of adding a None for non-included bands
         bandfluxes = {band: self.fluxes[band].getvalue(transformed=False) if
                       band in self.fluxes else None for band in bands}
-        return [comp.getprofiles(bandfluxes, engine, cenx, ceny, engineopts=engineopts) for comp in
-                self.components]
+        profiles = []
+        for comp in self.components:
+            profiles += comp.getprofiles(bandfluxes, engine, cenx, ceny, engineopts=engineopts)
+        return profiles
 
     def __init__(self, components, fluxes=[]):
         for i, comp in enumerate(components):
@@ -855,7 +974,6 @@ class EllipticalProfile(Component):
     """
         Class for any profile with a (generalized) ellipse shape.
         TODO: implement boxiness for libprofit; not sure if galsim does generalized ellipses?
-        TODO: implement multi-gaussian approximations
     """
     profilesavailable = ["moffat", "sersic"]
     mandatoryshape = ["ang", "axrat"]
@@ -884,6 +1002,15 @@ class EllipticalProfile(Component):
                 (value.fixed and fixed) or (not value.fixed and free)]
 
     def getprofiles(self, bandfluxes, engine, cenx, ceny, engineopts=None):
+        '''
+
+        :param bandfluxes: Dict of fluxes by band
+        :param engine: Rendering engine
+        :param cenx: X center in image coordinates
+        :param ceny: Y center in image coordinates
+        :param engineopts: Dict of engine options
+        :return: Dict by band with list of profiles
+        '''
         self._checkengine(engine)
         isgaussian = self.isgaussian()
 
@@ -908,14 +1035,19 @@ class EllipticalProfile(Component):
             profile = {param.name: param.getvalue(transformed=False) for param in
                        self.parameters.values()}
             if not 0 < profile["axrat"] <= 1:
-                raise ValueError("axrat {} ! >0 and <=1".format(profile["axrat"]))
+                if profile["axrat"] > 1:
+                    profile["axrat"] = 1
+                elif profile["axrat"] <= 0:
+                    profile["axrat"] = 1e-3
+                else:
+                    raise ValueError("axrat {} ! >0 and <=1".format(profile["axrat"]))
 
             cens = {"cenx": cenx, "ceny": ceny}
             # Does this profile have a non-zero size?
             # TODO: Review cutoff - it can't be zero for galsim or it will request huge FFTs
             resolved = not (
-                (self.profile == "sersic" and profile["re"] < 1e-3*(engine == "galsim")) or
-                (self.profile == "moffat" and profile["fwhm"] < 5e-4*(engine == "galsim"))
+                (self.profile == "sersic" and profile["re"] < 0*(engine == "galsim")) or
+                (self.profile == "moffat" and profile["fwhm"] < 0*(engine == "galsim"))
             )
             for key, value in cens.items():
                 if key in profile:
@@ -980,7 +1112,7 @@ class EllipticalProfile(Component):
             profile["pointsource"] = False
             profile["resolved"] = resolved
             profiles[band] = profile
-        return profiles
+        return [profiles]
 
     @classmethod
     def _checkparameters(cls, parameters, profile):
@@ -1015,6 +1147,188 @@ class EllipticalProfile(Component):
                 EllipticalProfile.profilesavailable))
         self._checkparameters(parameters, profile)
         self.profile = profile
+        Component.__init__(self, fluxes, name)
+        self.parameters = {param.name: param for param in parameters}
+
+
+def normalize(array):
+    array /= np.sum(array)
+    return array
+
+
+class MultiGaussianApproximationProfile(Component):
+    # TODO: Figure out a better way to split functionality between this and EllipticalProfile
+    # Maybe have a generic EllipticalProfile and SingleEllipticalProfile?
+    """
+        Class for multi-Gaussian profiles with (generalized) ellipse shape(s).
+    """
+    profilesavailable = ["sersic", "lux", "luv"]
+    mandatoryshape = ["ang", "axrat"]
+    ENGINES = ["galsim", "libprofit"]
+    mandatoryshape = ["ang", "axrat"]
+    mandatory = {
+        "sersic": mandatoryshape + ["nser", "re"],
+        "lux": mandatoryshape + ["re"],
+        "luv": mandatoryshape + ["re"],
+    }
+
+    weights = {
+        1: {
+            4: (normalize(np.array([0.09733, 1.12804, 4.99846, 5.63632])),
+                np.array([0.12068, 0.32730, 0.68542, 1.28089])),
+            6: (normalize(np.array([0.00735, 0.09480, 0.63570, 2.60073, 5.42849, 3.16451])),
+                np.array([0.05072, 0.13756, 0.28781, 0.53194, 0.91208, 1.50156])),
+            8: (normalize(np.array([0.00077, 0.01017, 0.07313, 0.13580, 0.25096, 1.39727,
+                                    3.56054, 4.74340])),
+                np.array([0.02393, 0.06490, 0.37188, 0.42942, 0.69672, 1.08879,
+                                    1.78732, 1.67294]))
+        },
+        4: {
+            6: (normalize(np.array([0.01308, 0.12425, 0.63551, 2.22560, 5.63989, 9.81523])),
+                np.array([0.00263, 0.01202, 0.04031, 0.12128, 0.36229, 1.23604])),
+            8: (normalize(np.array([0.00262, 0.02500, 0.13413, 0.51326, 1.52005, 3.56205,
+                                    6.44845, 8.10105])),
+                np.array([0.00113, 0.00475, 0.01462, 0.03930, 0.09926, 0.24699,
+                                    0.63883, 1.92560])),
+            10: (normalize(np.array([0.00139, 0.00941, 0.04441, 0.16162, 0.48121, 1.20357,
+                                     2.54182, 4.46441, 6.22821, 6.15393])),
+                 np.array([0.00087, 0.00296, 0.00792, 0.01902, 0.04289, 0.09351,
+                                     0.20168, 0.44126, 1.01833,2.74555])),
+        }
+    }
+
+    @classmethod
+    def _checkengine(cls, engine):
+        if engine not in Model.ENGINES:
+            raise ValueError("Unknown {:s} rendering engine {:s}".format(type(cls), engine))
+
+    def isgaussian(self):
+        return True
+
+    def getparameters(self, free=True, fixed=True):
+        return [value for value in self.fluxes if \
+                (value.fixed and fixed) or (not value.fixed and free)] + \
+            [value for value in self.parameters.values() if \
+                (value.fixed and fixed) or (not value.fixed and free)]
+
+    def getprofiles(self, bandfluxes, engine, cenx, ceny, engineopts=None):
+        self._checkengine(engine)
+
+        fluxesbands = {flux.band: flux for flux in self.fluxes}
+        for band in bandfluxes.keys():
+            if band not in fluxesbands:
+                raise ValueError(
+                    "Asked for EllipticalProfile (profile={:s}, name={:s}) model for band={:s} not in "
+                    "bands with fluxes {}".format(self.profile, self.name, band, fluxesbands))
+
+        profiles = [{} for _ in range(self.order)]
+        for band in bandfluxes.keys():
+            flux = fluxesbands[band].getvalue(transformed=False)
+            if fluxesbands[band].isfluxratio:
+                fluxratio = copy.copy(flux)
+                if not 0 <= fluxratio <= 1:
+                    raise ValueError("flux ratio not 0 <= {} <= 1".format(fluxratio))
+                flux *= bandfluxes[band]
+                # bandfluxes[band] -= flux
+                # TODO: Is subtracting as above best? Should be more accurate, but mightn't guarantee flux>=0
+                bandfluxes[band] *= (1.0-fluxratio)
+            profile = {param.name: param.getvalue(transformed=False) for param in
+                       self.parameters.values()}
+            if not 0 < profile["axrat"] <= 1:
+                if profile["axrat"] > 1:
+                    profile["axrat"] = 1
+                elif profile["axrat"] <= 0:
+                    profile["axrat"] = 1e-3
+                else:
+                    raise ValueError("axrat {} ! >0 and <=1".format(profile["axrat"]))
+
+            cens = {"cenx": cenx, "ceny": ceny}
+            for key, value in cens.items():
+                if key in profile:
+                    profile[key] += value
+                else:
+                    profile[key] = copy.copy(value)
+            if engine == "galsim":
+                axrat = profile["axrat"]
+                axratsqrt = np.sqrt(axrat)
+                gsparams = getgsparams(engineopts)
+            elif engine == "libprofit":
+                profile["profile"] = "sersic"
+                profile["nser"] = 0.5
+            else:
+                raise ValueError("Unimplemented rendering engine {:s}".format(engine))
+            profile["pointsource"] = False
+            profile["resolved"] = True
+
+            keyweight = profile["nser"] if self.profile == "sersic" else self.profile
+            weightsprofile = MultiGaussianApproximationProfile.weights[keyweight][self.order]
+            for subcomp, (weight, sigma) in enumerate(zip(weightsprofile[0], weightsprofile[1])):
+                weightprofile = copy.copy(profile)
+                if engine == "galsim":
+                    profilegs = gs.Gaussian(
+                        flux=weight*flux, fwhm=2.0*profile["re"]*axratsqrt*sigma,
+                        gsparams=gsparams
+                    )
+                    weightprofile.update({
+                        "profile": profilegs,
+                        "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=(profile["ang"] + 90.)*gs.degrees),
+                        "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
+                    })
+                elif engine == "libprofit":
+                    weightprofile["mag"] = -2.5 * np.log10(weight * flux)
+                profiles[subcomp][band] = weightprofile
+
+        return profiles
+
+    @classmethod
+    def _checkparameters(cls, parameters, profile, order):
+        mandatory = {param: False for param in EllipticalProfile.mandatory[profile]}
+        paramnamesneeded = mandatory.keys()
+        paramnames = [param.name for param in parameters]
+        errors = []
+        if len(paramnames) > len(set(paramnames)):
+            errors.append("Parameters array not unique")
+        # Check if these parameters are known (in mandatory)
+
+        if profile != "sersic" and order not in MultiGaussianApproximationProfile.weights[profile]:
+            raise ValueError("{} profile={} order={} not in supported {}".format(
+                self.__class__.__name__, profile, order,
+                MultiGaussianApproximationProfile.weights[profile].keys()))
+
+        for param in parameters:
+            if isinstance(param, FluxParameter):
+                errors.append("Param {:s} is {:s}, not {:s}".format(param.name, type(FluxParameter),
+                                                                    type(Parameter)))
+            if param.name in paramnamesneeded:
+                mandatory[param.name] = True
+                if param.name == "nser":
+                    nser = param.getvalue(transformed=False)
+                    if nser not in MultiGaussianApproximationProfile.weights:
+                        raise ValueError("{} profile={} {}={} not in supported {}".format(
+                            self.__class__.__name__, profile, param.name, nser,
+                            MultiGaussianApproximationProfile.weights.keys()))
+                    if order not in MultiGaussianApproximationProfile.weights[nser]:
+                        raise ValueError("{} profile={} ({}={}) order={} not in supported {}".format(
+                            self.__class__.__name__, profile, param.name, nser, order,
+                            MultiGaussianApproximationProfile.weights[nser].keys()))
+            elif param.name not in Component.optional:
+                errors.append("Unknown param {:s}".format(param.name))
+
+        for paramname, found in mandatory.items():
+            if not found:
+                errors.append("Missing mandatory param {:s}".format(paramname))
+        if errors:
+            errorstr = "Errors validating params of component (profile={:s}):\n" + \
+                       "\n".join(errors) + "\nPassed params:" + str(parameters)
+            raise ValueError(errorstr)
+
+    def __init__(self, fluxes, name="", profile="exp", parameters=None, order=6):
+        if profile not in MultiGaussianApproximationProfile.profilesavailable:
+            raise ValueError("Profile type={:s} not in available: ".format(profile) + str(
+                MultiGaussianApproximationProfile.profilesavailable))
+        self._checkparameters(parameters, profile, order)
+        self.profile = profile
+        self.order = order
         Component.__init__(self, fluxes, name)
         self.parameters = {param.name: param for param in parameters}
 
@@ -1071,7 +1385,6 @@ class PointSourceProfile(Component):
                 profile["pointsource"] = True
             else:
                 raise ValueError("Unimplemented PointSourceProfile rendering engine {:s}".format(engine))
-            profiles[band] = profile
         return profiles
 
     def __init__(self, fluxes, name=""):
