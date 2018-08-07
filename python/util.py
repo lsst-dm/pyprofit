@@ -65,7 +65,7 @@ def truncnormlogpdfmean(x, mean=0., scale=1., a=-np.inf, b=np.inf):
     return stats.truncnorm.logpdf(x - mean, scale=scale, a=a, b=b)
 
 
-def getparamdefault(param, value=None, profile=None, fixed=False):
+def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransformed=False):
     transform = transformsref["none"]
     limits = limitsref["none"]
     name = param
@@ -95,7 +95,7 @@ def getparamdefault(param, value=None, profile=None, fixed=False):
     if value is None:
         # TODO: Improve this (at least check limits)
         value = 0.
-    else:
+    elif not isvaluetransformed:
         value = transform.transform(value)
 
     param = proobj.Parameter(name, value, "", limits=limits,
@@ -105,7 +105,7 @@ def getparamdefault(param, value=None, profile=None, fixed=False):
 
 def getmodel(
     fluxesbyband, modelstr, imagesize, sizes, axrats, angs, slopes=None, fluxfracs=None,
-    offsetxy=None, name="", nexposures=1, engine="galsim", engineopts=None
+    offsetxy=None, name="", nexposures=1, engine="galsim", engineopts=None, istransformedvalues=False
 ):
     bands = fluxesbyband.keys()
     modelstrs = modelstr.split(",")
@@ -176,11 +176,6 @@ def getmodel(
             "axrat": axrats,
             "ang": angs,
         }
-        # TODO: The implementation of MultiGaussian should have a list of supported slopes
-        if ismultigaussiansersic:
-            if any([not (x == 1 or x == 4) for x in slopes]):
-                raise ValueError("Requested {} profile from getmodel but specified "
-                                 "slopes {} not all in [1,4]".format(profile, slopes))
         if not issoftened:
             values["slope"] = slopes
 
@@ -193,7 +188,8 @@ def getmodel(
                 for band in bands
             ]
             params = [getparamdefault(param, valueslice[compi], profile,
-                                      fixed=param == "slope" and (isgaussian or ismultigaussiansersic))
+                                      fixed=param == "slope" and (isgaussian or ismultigaussiansersic),
+                                      isvaluetransformed=istransformedvalues)
                       for param, valueslice in values.items()]
             if ismultigaussiansersic or issoftened:
                 components.append(proobj.MultiGaussianApproximationProfile(
@@ -202,7 +198,7 @@ def getmodel(
                 components.append(proobj.EllipticalProfile(
                     paramfluxescomp, profile=profile, parameters=params))
 
-        compnum += ncomps
+        compnum += nprofiles
 
     paramfluxes = [proobj.FluxParameter(
             band, "flux", np.log10(fluxesbyband[band]), "", limits=limitsref["none"],
