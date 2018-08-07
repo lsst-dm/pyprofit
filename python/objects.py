@@ -14,7 +14,6 @@ import time
 #gaussian_sigma_to_fwhm = 2.35482004503094932701
 #gaussian_fwhm_to_sigma = 0.424660900144009534340
 
-
 # https://stackoverflow.com/questions/3844801/check-if-all-elements-in-a-list-are-identical
 # Can get better performance but this isn't critical as it's just being used to check if bands are identical
 def allequal(iterator):
@@ -132,7 +131,7 @@ class PSF:
             self.image = data.exposures[self.band][0].meta["modelimage"]
             model.sources[0].modelastrometric = astro
 
-        # TODO: There's more torturous logic here if we're to support changing engines on the fly
+        # TODO: There's more torturous logic needed here if we're to support changing engines on the fly
         if engine != self.engine:
             if engine == "galsim":
                 gsparams = getgsparams(engineopts)
@@ -170,6 +169,21 @@ class PSF:
             self.engine = engine
 
 
+def getprofilegausscovar(ang, axrat, re):
+    ang = np.radians(ang)
+    sinang = np.sin(ang)
+    cosang = np.cos(ang)
+    majsq = (2.*re)**2
+    minsq = majsq*axrat**2
+    sinangsq = sinang**2
+    cosangsq = cosang**2
+    sigxsq = majsq*cosangsq + minsq*sinangsq
+    sigysq = majsq*sinangsq + minsq*cosangsq
+    covxy = (majsq-minsq)*cosang*sinang
+    covar = np.matrix([[sigxsq, covxy], [covxy, sigysq]])
+    return covar
+
+
 class Model:
     likefuncs = {
         "normal": "normal"
@@ -187,7 +201,7 @@ class Model:
 
     def evaluate(self, params=None, data=None, bands=None, engine=None, engineopts=None,
                  paramstransformed=True, getlikelihood=True, likelihoodlog=True, keeplikelihood=False,
-                 keepimages=False, plot=False):
+                 keepimages=False, plot=False, figure=None, axes=None, figurerow=None, modelname="Model"):
         """
             Get the likelihood and/or model images
         """
@@ -222,12 +236,13 @@ class Model:
             bands = data.exposures.keys()
         if plot:
             plotslen = 0
-            for band in bands:
-                plotslen += len(data.exposures[band])
-            figure, axes = plt.subplots(nrows=plotslen + (plotslen == 3), ncols=5)
-            if plotslen == 1:
-                axes.shape = (1, 5)
-            figurerow = 0
+            if figure is None or axes is None or figurerow is None:
+                for band in bands:
+                    plotslen += len(data.exposures[band])
+                figure, axes = plt.subplots(nrows=plotslen + (plotslen == 3), ncols=5)
+                if plotslen == 1:
+                    axes.shape = (1, 5)
+                figurerow = 0
         else:
             figaxes = None
         chis = []
@@ -247,7 +262,7 @@ class Model:
                         figurerow += 1
                     likelihoodexposure, chi, chiimg, chiclip, imgclip, modelclip = \
                         self.getexposurelikelihood(
-                            exposure, image, log=likelihoodlog, figaxes=figaxes)
+                            exposure, image, log=likelihoodlog, figaxes=figaxes, modelname=modelname)
                     if keeplikelihood:
                         exposure.meta["likelihood"] = likelihoodexposure
                         exposure.meta["likelihoodlog"] = likelihoodlog
@@ -255,8 +270,8 @@ class Model:
                         likelihood += likelihoodexposure
                     else:
                         likelihood *= likelihoodexposure
+                    chis.append(chi)
                     if plot and plotslen == 3:
-                        chis.append(chi)
                         chiclips.append(chiclip)
                         chiimgs.append(chiimg)
                         imgclips.append(imgclip)
@@ -268,7 +283,7 @@ class Model:
                                         chiclips, (figure, axes[figurerow]))
             plt.tight_layout()
             plt.subplots_adjust(wspace=0.05, hspace=0.05)
-        return likelihood, params
+        return likelihood, params, chis
 
     def plotexposurescolor(self, images, modelimages, chis, chiimgs, chiclips, figaxes):
         # TODO: verify lengths
@@ -309,7 +324,7 @@ class Model:
             axes[i].set_yticklabels([])
 
     def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None,
-                              figaxes=None, maximg=None, minimg=None):
+                              figaxes=None, maximg=None, minimg=None, modelname="Model"):
         if likefunc is None:
             likefunc = self.likefunc
         hasmask = exposure.maskinverse is not None
@@ -338,7 +353,7 @@ class Model:
                     z = exposure.maskinverse
                     axes[i].contour(x, y, z)
             axes[0].set_title('Band={}'.format(exposure.band))
-            axes[1].set_title('Model'.format(exposure.band))
+            axes[1].set_title(modelname)
             # The (logged) difference map
             chilog = np.log10(np.clip(np.abs(chi), minimg, np.inf)/minimg)*np.sign(chi)
             chilog /= np.log10(maximg/minimg)
@@ -401,7 +416,6 @@ class Model:
         return likelihood, chi, chilog, chiclip, imgclips[0], imgclips[1]
 
 
-    # TODO: Implement analytic Gaussian convolution
     def getexposuremodel(self, exposure, engine=None, engineopts=None):
         """
             Draw model image for one exposure with one PSF
@@ -411,18 +425,60 @@ class Model:
         if engineopts is None:
             engineopts = self.engineopts
         Model._checkengine(engine)
+        if engine == "galsim":
+            gsparams = getgsparams(engineopts)
         ny, nx = exposure.image.shape
         band = exposure.band
         profiles = self.getprofiles([band], engine=engine)
 
         haspsf = exposure.psf is not None
-        allgaussian = haspsf and exposure.psf.model is not None and \
-            all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and \
-            all([comp.isgaussian() for comps in [src.modelphotometric.components for src in self.sources]
-                 for comp in comps])
+        allgaussian = (
+            haspsf and exposure.psf.model is not None and
+            all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and
+            any([comp.isgaussian() for comps in [src.modelphotometric.components for src in self.sources]
+                 for comp in comps]))
         if allgaussian:
-            # TODO: actually implement this.
-            pass
+            # Note that libprofit uses the irritating GALFIT convention, so reverse that
+            varsgauss = ["ang", "axrat", "re"]
+            covarprofilessrc = [(getprofilegausscovar
+                                 (**{var: profile[band][var] + 90*(var == "ang") for var in varsgauss}) if
+                                 profile[band]["nser"] == 0.5 else None,
+                                 profile[band]) for
+                                profile in self.getprofiles([band], engine="libprofit")]
+
+            profilesnew = []
+            for idxpsf, profilepsf in enumerate(exposure.psf.model.getprofiles(
+                    bands=[band], engine="libprofit")):
+                fluxfrac = 10**(-0.4*profilepsf[band]["mag"])
+                covarpsf = getprofilegausscovar(**{var: profilepsf[band][var] + 90*(var == "ang") for
+                                                   var in varsgauss})
+                for idxsrc, (covarsrc, profile) in enumerate(covarprofilessrc):
+                    if covarsrc is not None:
+                        eigenvals, eigenvecs = np.linalg.eig(covarpsf + covarsrc)
+                        indexmaj = np.argmax(eigenvals)
+                        fwhm = np.sqrt(eigenvals[indexmaj])
+                        axrat = np.sqrt(eigenvals[1-indexmaj])/fwhm
+                        ang = np.degrees(np.arctan2(eigenvecs[1, indexmaj], eigenvecs[0, indexmaj]))
+                        if engine == "libprofit":
+                            profile["re"] = fwhm/2.0
+                            profile["axrat"] = axrat
+                            profile["flux"] *= fluxfrac
+                            profile["ang"] = ang
+                        else:
+                            profile = {
+                                "profile": gs.Gaussian(flux=10**(-0.4*profile["mag"])*fluxfrac,
+                                                       fwhm=fwhm*np.sqrt(axrat), gsparams=gsparams),
+                                "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=ang*gs.degrees),
+                                "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
+                            }
+                        profile["pointsource"] = True
+                        profile["resolved"] = True
+                        profile = {band: profile}
+                    else:
+                        profile = profiles[idxsrc]
+                    if covarsrc is not None or idxpsf == 0:
+                        profilesnew.append(profile)
+            profiles = profilesnew
 
         if engine == "libprofit":
             profilespro = {}
@@ -463,8 +519,8 @@ class Model:
             image = np.array(pyp.make_model(profit_model)[0])
         elif engine == "galsim":
             profilesgs = {
-                True: None
-                , False: None
+                True: {"small": None, "big": None},
+                False: {"all": None},
             }
             cenimg = gs.PositionD(nx/2., ny/2.)
             for profile in profiles:
@@ -478,12 +534,14 @@ class Model:
                         profile["shear"]).shift(
                         profile["offset"] - cenimg)
                     convolve = haspsf and not profile["pointsource"]
-                if profilesgs[convolve] is None:
-                    profilesgs[convolve] = profilegs
+                profiletype = "all" if not convolve else ("small" if profilegs.original.half_light_radius <
+                                                                     1 else "big")
+                if profilesgs[convolve][profiletype] is None:
+                    profilesgs[convolve][profiletype] = profilegs
                 else:
-                    profilesgs[convolve] += profilegs
+                    profilesgs[convolve][profiletype] += profilegs
+            profilesgs[False] = profilesgs[False]["all"]
 
-            gsparams = getgsparams(engineopts)
             if haspsf:
                 psfgs = exposure.psf.model
                 if psfgs is None:
@@ -500,11 +558,20 @@ class Model:
                             profilespsf = profilegs
                         else:
                             profilespsf += profilegs
-                profilesgs[True] = gs.Convolve(profilesgs[True], profilespsf, gsparams=gsparams)
+                profilesgsconv = None
+                for sizebin, profilesbin in profilesgs[True].items():
+                    if profilesbin is not None:
+                        profilesbin = gs.Convolve(profilesbin, profilespsf, gsparams=gsparams)
+                        if profilesgsconv is None:
+                            profilesgsconv = profilesbin
+                        else:
+                            profilesgsconv += profilesbin
+                profilesgs[True] = profilesgsconv
             else:
-                if profilesgs[True] is not None:
+                if any([x is not None for x in profilesgs[True].values()]):
                     raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
                         exposure.band))
+                profilesgs[True] = None
             if self.engineopts is not None and "drawmethod" in self.engineopts:
                 method = self.engineopts["drawmethod"]
             else:
@@ -525,7 +592,7 @@ class Model:
                             profilesgs = profilesgs[True]
                     else:
                         profilesgs = profilesgs[False]
-
+                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=1)
             except RuntimeError as e:
                 if method == "fft":
                     if haspsfimage:
@@ -556,7 +623,7 @@ class Model:
         '''
 
         :param bands: List of bands
-        :param engine: Valid engine
+        :param engine: Valid rendering engine
         :param engineopts: Dict of engine options
         :return: List of profiles
         '''
@@ -596,8 +663,8 @@ class Model:
         params = self.getparameters(free=free, fixed=fixed)
         return [param.getprior.mode for param in params]
 
-    def getlikelihood(self, params=None, data=None, log=True, plot=False):
-        likelihood = self.evaluate(params, data, likelihoodlog=log, plot=plot)[0]
+    def getlikelihood(self, params=None, data=None, log=True, **kwargs):
+        likelihood = self.evaluate(params, data, likelihoodlog=log, **kwargs)[0]
         return likelihood
 
     def __init__(self, sources, data=None, likefunc="normal", engine=None, engineopts=None):
@@ -663,7 +730,6 @@ class Modeller:
         store info that they don't track (mainly per-iteration info, including parameter values,
         running time, separate priors and likelihoods rather than just the objective, etc.).
     """
-    # TODO: Implement
     def evaluate(self, paramsfree=None, timing=False, returnlponly=False, returnlog=True, plot=False):
 
         if timing:
@@ -702,7 +768,6 @@ class Modeller:
         return rv
 
     def fit(self, paramsinit=None, printfinal=True, timing=None, maxwalltime=np.Inf, printsteps=None):
-        # TODO: Calculate log prior of non-fitted params
         self.fitinfo["priorLogfixed"] = self.model.getpriorvalue(free=False, fixed=True, log=True)
         self.fitinfo["log"] = []
         self.fitinfo["printsteps"] = printsteps
@@ -712,8 +777,6 @@ class Modeller:
             # TODO: Why did I think I would want to do this?
             #paramsinit = self.model.getpriormodes(free=True, fixed=False)
 
-        # TODO: Finish implementing this
-        #paramnames = self.model.getparamnames(fixed=False)
         paramnames = [param.name for param in self.model.getparameters(fixed=False)]
         print("Param names:\n", paramnames)
         print("Initial parameters:\n", paramsinit)
@@ -791,11 +854,12 @@ class Modeller:
             print("Final likelihood: {}".format(self.evaluate(paramsbest)))
             print("Parameter names:        " + ",".join(["{:10s}".format(i) for i in paramnames]))
             print("Transformed parameters: " + ",".join(["{:.4e}".format(i) for i in paramsbest]))
-            # TODO: Finish
+            # TODO: Finish this
             #print("Parameters (linear): " + ",".join(["{:.4e}".format(i) for i in paramstransformed]))
 
         result = {
             "fitinfo": copy.copy(self.fitinfo),
+            "paramnames": paramnames,
             "paramsbest": paramsbest,
             "result": result,
             "time": timerun,
@@ -813,6 +877,7 @@ class Modeller:
         self.fitinfo = {
             "priorLogfixed": np.log(1.0)
         }
+
 
 class Source:
     """
@@ -855,15 +920,17 @@ class PhotometricModel:
             params += comp.getparameters(free=free, fixed=fixed)
         return params
 
+    # TODO: Determine how the astrometric model is supposed to interact here
     def getprofiles(self, engine, bands, cenx, ceny, time=None, engineopts=None):
         '''
 
-        :param engine:
-        :param bands:
-        :param cenx:
+        :param engine: Valid rendering engine
+        :param bands: List of bands
+        :param cenx: X coordinate
         :param ceny:
-        :param time:
-        :param engineopts:
+        :param time: A time for variable sources. Should actually be a duration for very long
+        exposures/highly variable sources.
+        :param engineopts: Dict of engine options
         :return: List of dicts by band
         '''
         # TODO: Check if this should skip entirely instead of adding a None for non-included bands
@@ -1181,7 +1248,7 @@ class MultiGaussianApproximationProfile(Component):
             8: (normalize(np.array([0.00077, 0.01017, 0.07313, 0.13580, 0.25096, 1.39727,
                                     3.56054, 4.74340])),
                 np.array([0.02393, 0.06490, 0.37188, 0.42942, 0.69672, 1.08879,
-                                    1.78732, 1.67294]))
+                          1.78732, 1.67294]))
         },
         4: {
             6: (normalize(np.array([0.01308, 0.12425, 0.63551, 2.22560, 5.63989, 9.81523])),
@@ -1189,11 +1256,11 @@ class MultiGaussianApproximationProfile(Component):
             8: (normalize(np.array([0.00262, 0.02500, 0.13413, 0.51326, 1.52005, 3.56205,
                                     6.44845, 8.10105])),
                 np.array([0.00113, 0.00475, 0.01462, 0.03930, 0.09926, 0.24699,
-                                    0.63883, 1.92560])),
+                          0.63883, 1.92560])),
             10: (normalize(np.array([0.00139, 0.00941, 0.04441, 0.16162, 0.48121, 1.20357,
                                      2.54182, 4.46441, 6.22821, 6.15393])),
                  np.array([0.00087, 0.00296, 0.00792, 0.01902, 0.04289, 0.09351,
-                                     0.20168, 0.44126, 1.01833,2.74555])),
+                           0.20168, 0.44126, 1.01833, 2.74555])),
         }
     }
 
@@ -1254,7 +1321,6 @@ class MultiGaussianApproximationProfile(Component):
                 gsparams = getgsparams(engineopts)
             elif engine == "libprofit":
                 profile["profile"] = "sersic"
-                profile["nser"] = 0.5
             else:
                 raise ValueError("Unimplemented rendering engine {:s}".format(engine))
             profile["pointsource"] = False
@@ -1264,18 +1330,18 @@ class MultiGaussianApproximationProfile(Component):
             weightsprofile = MultiGaussianApproximationProfile.weights[keyweight][self.order]
             for subcomp, (weight, sigma) in enumerate(zip(weightsprofile[0], weightsprofile[1])):
                 weightprofile = copy.copy(profile)
+                re = profile["re"]*sigma
                 if engine == "galsim":
-                    profilegs = gs.Gaussian(
-                        flux=weight*flux, fwhm=2.0*profile["re"]*axratsqrt*sigma,
-                        gsparams=gsparams
-                    )
+                    profilegs = gs.Gaussian(flux=weight*flux, fwhm=2.0*re*axratsqrt, gsparams=gsparams)
                     weightprofile.update({
                         "profile": profilegs,
                         "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=(profile["ang"] + 90.)*gs.degrees),
                         "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
                     })
                 elif engine == "libprofit":
+                    weightprofile["nser"] = 0.5
                     weightprofile["mag"] = -2.5 * np.log10(weight * flux)
+                    weightprofile["re"] = re
                 profiles[subcomp][band] = weightprofile
 
         return profiles
@@ -1305,11 +1371,11 @@ class MultiGaussianApproximationProfile(Component):
                     nser = param.getvalue(transformed=False)
                     if nser not in MultiGaussianApproximationProfile.weights:
                         raise ValueError("{} profile={} {}={} not in supported {}".format(
-                            self.__class__.__name__, profile, param.name, nser,
+                            cls.__class__.__name__, profile, param.name, nser,
                             MultiGaussianApproximationProfile.weights.keys()))
                     if order not in MultiGaussianApproximationProfile.weights[nser]:
                         raise ValueError("{} profile={} ({}={}) order={} not in supported {}".format(
-                            self.__class__.__name__, profile, param.name, nser, order,
+                            cls.__class__.__name__, profile, param.name, nser, order,
                             MultiGaussianApproximationProfile.weights[nser].keys()))
             elif param.name not in Component.optional:
                 errors.append("Unknown param {:s}".format(param.name))
@@ -1458,7 +1524,6 @@ class Parameter:
             prior = self.prior.getvalue(param=self, log=log)
         return prior
 
-    # TODO: Decide what to do about inclusiveness
     def getlimits(self, transformed=False):
         lower = self.limits.lower
         upper = self.limits.upper
