@@ -186,10 +186,10 @@ def getprofilegausscovar(ang, axrat, re):
 
 class Model:
     likefuncs = {
-        "normal": "normal"
-        , "gaussian": "normal"
-        , "student-t": "t"
-        , "t": "t"
+        "normal": "normal",
+        "gaussian": "normal",
+        "student-t": "t",
+        "t": "t",
     }
 
     ENGINES = ["galsim", "libprofit"]
@@ -259,10 +259,12 @@ class Model:
                 if getlikelihood or plot:
                     if plot:
                         figaxes = (figure, axes[figurerow])
-                        figurerow += 1
                     likelihoodexposure, chi, chiimg, chiclip, imgclip, modelclip = \
                         self.getexposurelikelihood(
-                            exposure, image, log=likelihoodlog, figaxes=figaxes, modelname=modelname)
+                            exposure, image, log=likelihoodlog, figaxes=figaxes, modelname=modelname,
+                            istoprow=figurerow is None or figurerow == 0,
+                            isbottomrow=figurerow is None or axes is None or (figurerow+1) == axes.shape[0]
+                        )
                     if keeplikelihood:
                         exposure.meta["likelihood"] = likelihoodexposure
                         exposure.meta["likelihoodlog"] = likelihoodlog
@@ -271,11 +273,13 @@ class Model:
                     else:
                         likelihood *= likelihoodexposure
                     chis.append(chi)
-                    if plot and plotslen == 3:
-                        chiclips.append(chiclip)
-                        chiimgs.append(chiimg)
-                        imgclips.append(imgclip)
-                        modelclips.append(modelclip)
+                    if plot:
+                        figurerow += 1
+                        if plotslen == 3:
+                            chiclips.append(chiclip)
+                            chiimgs.append(chiimg)
+                            imgclips.append(imgclip)
+                            modelclips.append(modelclip)
             # Color images! whooo
         if plot:
             if plotslen == 3:
@@ -324,7 +328,8 @@ class Model:
             axes[i].set_yticklabels([])
 
     def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None,
-                              figaxes=None, maximg=None, minimg=None, modelname="Model"):
+                              figaxes=None, maximg=None, minimg=None, modelname="Model", istoprow=True,
+                              isbottomrow=True):
         if likefunc is None:
             likefunc = self.likefunc
         hasmask = exposure.maskinverse is not None
@@ -348,12 +353,13 @@ class Model:
                 imgclip = (np.log10(np.clip(img, minimg, maximg)) - np.log10(minimg))/np.log10(maximg/minimg)
                 imgclips.append(imgclip)
                 axes[i].imshow(imgclip, cmap='gray', origin="bottom")
-                axes[i].set_xticklabels([])
                 if hasmask:
                     z = exposure.maskinverse
                     axes[i].contour(x, y, z)
-            axes[0].set_title('Band={}'.format(exposure.band))
-            axes[1].set_title(modelname)
+            axes[0].set_ylabel('Band={}'.format(exposure.band))
+            # Check if the modelname is informative as it's redundant otherwise
+            if modelname != "Model":
+                axes[1].set_ylabel(modelname)
             # The (logged) difference map
             chilog = np.log10(np.clip(np.abs(chi), minimg, np.inf)/minimg)*np.sign(chi)
             chilog /= np.log10(maximg/minimg)
@@ -390,7 +396,16 @@ class Model:
             axes[4].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
             axes[4].yaxis.tick_right()
             for i in range(1, 5):
-                axes[i].set_yticklabels([])
+                if i != 4:
+                    axes[i].set_yticklabels([])
+                axes[i].yaxis.set_label_position("right")
+                if not isbottomrow:
+                    axes[i].set_xticklabels([])
+            if istoprow:
+                axes[0].set_title("Data")
+                axes[1].set_title("Model")
+                axes[2].set_title("Residual")
+                axes[3].set_title("Residual/sigma")
         else:
             chilog = None
             chiclip = None
@@ -751,9 +766,9 @@ class Modeller:
             tstep = time.time() - tinit
             rv += tstep
         loginfo = {
-            "params": paramsfree
-            , "likelihood": likelihood
-            , "prior": prior
+            "params": paramsfree,
+            "likelihood": likelihood,
+            "prior": prior,
         }
         if timing:
             loginfo["time"] = tstep
@@ -1046,8 +1061,8 @@ class EllipticalProfile(Component):
     mandatoryshape = ["ang", "axrat"]
     # TODO: Consider adopting gs's flexible methods of specifying re, fwhm, etc.
     mandatory = {
-        "moffat": mandatoryshape + ["con", "fwhm"]
-        , "sersic": mandatoryshape + ["nser", "re"]
+        "moffat": mandatoryshape + ["con", "fwhm"],
+        "sersic": mandatoryshape + ["nser", "re"],
     }
 
     ENGINES = ["galsim", "libprofit"]
