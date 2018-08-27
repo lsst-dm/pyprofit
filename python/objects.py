@@ -239,7 +239,9 @@ class Model:
             if figure is None or axes is None or figurerow is None:
                 for band in bands:
                     plotslen += len(data.exposures[band])
-                figure, axes = plt.subplots(nrows=plotslen + (plotslen == 3), ncols=5)
+                nrows = plotslen + (plotslen == 3)
+                figure, axes = plt.subplots(nrows=nrows, ncols=5,
+                                            figsize=(10, 2*nrows), dpi=100)
                 if plotslen == 1:
                     axes.shape = (1, 5)
                 figurerow = 0
@@ -874,6 +876,7 @@ class Modeller:
 
         result = {
             "fitinfo": copy.copy(self.fitinfo),
+            "params": self.model.getparameters(),
             "paramnames": paramnames,
             "paramsbest": paramsbest,
             "result": result,
