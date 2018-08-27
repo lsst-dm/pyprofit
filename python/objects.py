@@ -9,6 +9,7 @@ import pyprofit as pyp
 import scipy.stats as spstats
 import scipy.optimize as spopt
 import seaborn as sns
+import sys
 import time
 
 #gaussian_sigma_to_fwhm = 2.35482004503094932701
@@ -782,6 +783,7 @@ class Modeller:
             stepnum = len(self.fitinfo["log"])
             if stepnum % self.fitinfo["printsteps"] == 0:
                 print(stepnum, rv, loginfo)
+                sys.stdout.flush()
         return rv
 
     def fit(self, paramsinit=None, printfinal=True, timing=None, maxwalltime=np.Inf, printsteps=None):
@@ -799,6 +801,8 @@ class Modeller:
         print("Param names:\n", paramnames)
         print("Initial parameters:\n", paramsinit)
         print("Evaluating initial parameters:\n", self.evaluate(paramsinit))
+
+        sys.stdout.flush()
 
         timerun = 0.0
 

@@ -10,6 +10,7 @@ import numpy as np
 import os
 import pickle
 import scipy.optimize as spopt
+import sys
 import traceback
 import time
 
@@ -239,6 +240,7 @@ def fitgalaxy(img, psf, sigmainverse, band, mask=None, modellib=None, algo=None,
             axes = None
         for modelidx, modelname in enumerate(modelinfos):
             print("Fitting model {:s} using engine {:s}".format(modelname, engine))
+            sys.stdout.flush()
             model = models[engine]
             nser = modelinfos[modelname]["nser"]
             if modelname.startswith("multi"):
