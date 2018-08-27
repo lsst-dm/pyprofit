@@ -791,6 +791,7 @@ class Modeller:
 
         if paramsinit is None:
             paramsinit = [param.getvalue(transformed=True) for param in self.model.getparameters(fixed=False)]
+            paramsinit = np.array(paramsinit)
             # TODO: Why did I think I would want to do this?
             #paramsinit = self.model.getpriormodes(free=True, fixed=False)
 
