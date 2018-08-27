@@ -21,7 +21,7 @@ limitsref = {
     "fractionlog10": proobj.Limits(upper=0., transformed=True),
     "axratlog10": proobj.Limits(lower=-2., upper=0., transformed=True),
     "coninverse": proobj.Limits(lower=0.1, upper=0.9090909, transformed=True),
-    "nserlog10": proobj.Limits(lower=np.log10(0.3), upper=np.log10(6.2), lowerinclusive=False,
+    "nserlog10": proobj.Limits(lower=np.log10(0.3), upper=np.log10(6.0), lowerinclusive=False,
                                upperinclusive=False, transformed=True),
 }
 
