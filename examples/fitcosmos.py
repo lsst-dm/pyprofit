@@ -82,6 +82,7 @@ def fitmodel(model, modeller=None, modellib=None, modellibopts=None, printfinal=
         if modelnameappendparams is not None:
             for string, param in modelnameappendparams:
                 modeldesc += string.format(param.getvalue(transformed=False))
+        plt.show(block=False)
     else:
         modeldesc = None
     _, _, chis = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modeldesc, figure=figure,
@@ -224,7 +225,10 @@ def fitgalaxy(img, psf, sigmainverse, band, mask=None, modellib=None, algo=None,
         print("Warnings: " + " && ".join(errors))
         #raise RuntimeError("Errors: " + " && ".join(errors))
 
-    remax = np.sqrt(np.sum((npiximg/2.)**2))
+    maxvalues = {
+        "re": np.sqrt(np.sum((npiximg/2.)**2)),
+        "flux": 10*np.sum(img.array),
+    }
 
     for modelname in modelinfos:
         modelinfos[modelname]["fits"] = {}
@@ -265,10 +269,12 @@ def fitgalaxy(img, psf, sigmainverse, band, mask=None, modellib=None, algo=None,
                 init = modelinfos[modelbest]["fits"][engine][-1]["paramsbestall"]
             for value, param in zip(init, model.getparameters(fixed=toinitfromother)):
                 param.setvalue(value, transformed=True)
-                if param.name == "re":
+                if param.name in maxvalues:
                     param.limits = copy.deepcopy(param.limits)
-                    param.limits.upper = (param.transform.transform(remax) if
-                                          param.limits.transformed else remax)
+                    maxval = maxvalues[param.name]
+                    param.limits.upper = (param.transform.transform(maxval) if
+                                          param.limits.transformed else maxval)
+                if param.name == "re":
                     if not toinitfromother and (modelname == "dev" or modelname == "multidev"):
                         re = param.getvalue(transformed=False)
                         param.setvalue(re*(1 + 0.25*((re < 1) + (re < 10))), transformed=False)
@@ -374,7 +380,7 @@ def fitgalaxy(img, psf, sigmainverse, band, mask=None, modellib=None, algo=None,
                 param.fixed = False
             if param.name == "re":
                 param.limits = copy.deepcopy(param.limits)
-                remaxcomp = remax
+                remaxcomp = maxvalues["re"]
                 if not hassetbulge[param.name]:
                     param.setvalue(rebulge, transformed=True)
                     remaxcomp = param.getvalue(transformed=False)
@@ -448,6 +454,7 @@ if __name__ == '__main__':
         'fithsc':      {'type': proutil.str2bool, 'default': False, 'help': 'Fit HST F814W image'},
         'fithst2hsc':  {'type': proutil.str2bool, 'default': False, 'help': 'Fit HST F814W image convolved '
                                                                             'to HSC seeing'},
+        'hst2hscmodel': {'type': str, 'default': None, 'help': 'HST model fit to use for mock HSC image'},
         'psfmodel':    {'type': str,   'default': None, 'help': 'PSF model'},
         'psfsizes':    {'type': int,   'nargs': '*', 'help': 'PSF image sizes (pixels)'},
         'psffluxes':   {'type': float, 'nargs': '*', 'help': 'PSF fluxes [counts]'},
@@ -495,7 +502,7 @@ if __name__ == '__main__':
         print("Not using COSMOSCatalog")
         ccat = None
 
-    if args.fileout is not None and os.path.isfile(args.fileout):
+    if args.fileout is not None and os.path.isfile(os.path.expanduser(args.fileout)):
         with open(os.path.expanduser(args.fileout), 'rb') as f:
             data = pickle.load(f)
     else:
@@ -523,13 +530,24 @@ if __name__ == '__main__':
         srcs += ["hsc"]
     if args.fithst2hsc:
         srcs += ["hst2hsc"]
+    modeltypes = {
+        modelname:
+            "sersic:1,sersic:1" if modelname in ["serexp", "serser"] else
+            "multigaussiansersic:1,sersic:1" if modelname in ["cmodel", "devexp"] else
+            "multigaussian" if modelname in ["multiexp", "multidev"] else
+            "sersic" if modelname in ["gauss", "exp", "dev", "ser"] else None for modelname in
+        ["gauss", "exp", "dev", "ser"] + ["multiexp", "multidev"] +
+        ["cmodel", "devexp"] + ["serexp", "serser"]
+    }
 
     nfit = 0
     for index in args.indices:
         idrange = [np.int(x) for x in index.split(",")]
-        for id in range(idrange[0], idrange[0+(len(idrange)>1)]+1):
+        for id in range(idrange[0], idrange[0+(len(idrange)>1)] + (len(idrange)==1)):
             print("Fitting COSMOS galaxy with ID: {}".format(id))
             try:
+                np.random.seed(id)
+                src = None
                 radec = rgcfits[id][1:3]
                 imghst = rgcat.getGalImage(id)
                 fluxhst = rgcat.stamp_flux[id]
@@ -562,6 +580,7 @@ if __name__ == '__main__':
                     sizeCutout = np.int(4 + np.ceil(np.max(imghst.array.shape) * scalehst / scalehsc))
                     sizeCutout += np.int(sizeCutout % 2)
                 for src in srcs:
+                    srcname = src
                     bands = [rgcat.band[id] if src == "hst" else "HSC-I"]
                     for band in bands:
                         if src == "hst":
@@ -634,6 +653,7 @@ if __name__ == '__main__':
                                 result = spopt.minimize(getoffsetchisq,
                                                         [np.log10(scalefluxhst2hsc), 0, 0],
                                                         method="Nelder-Mead")
+                                fluxscale = (10**result.x[0])
 
                                 if args.plot:
                                     ax[1, 1].imshow(np.log10(
@@ -644,7 +664,52 @@ if __name__ == '__main__':
                                     ax[1, 1].set_title("COSMOS GalSim rotated+shifted")
 
                                 # Assuming that these images match, add HSC noise back in
-                                img = getoffsetchisq(result.x, returnimg=True)
+                                if args.hst2hscmodel is None:
+                                    img = getoffsetchisq(result.x, returnimg=True)
+                                else:
+                                    fits = data[id]['hst']['fits']
+                                    if args.hst2hscmodel == 'best':
+                                        chisqredsmodel = {
+                                            model: fit['fits']['galsim'][-1]['chisqred'] for model, fit in
+                                            fits.items() if 'galsim' in fit['fits']
+                                        }
+                                        modeltouse = min(chisqredsmodel, key=chisqredsmodel.get)
+                                    else:
+                                        modeltouse = args.hst2hscmodel
+                                    srcname = "_".join([src, args.hst2hscmodel])
+                                    # TODO: Store the name of the PyProFit model somewhere
+                                    # In fact there wasn't really any need to store a model since we
+                                    # can reconstruct it, but let's go ahead and use the unpickled one
+                                    paramsbest = fits[modeltouse]['fits']['galsim'][-1]['paramsbestall']
+                                    # Apply all of the same rotations and shifts directly to the model
+                                    modeltouse = data[id]['hst']['models']['galsim'][modeltypes[modeltouse]]
+                                    scalefactor = scalehst/scalehsc
+                                    imghstshape = imghst.array.shape
+                                    # I'm pretty sure that these should all be converted to arcsec units
+                                    for param, value in zip(modeltouse.getparameters(fixed=True), paramsbest):
+                                        param.setvalue(value, transformed=True)
+                                        valueset = param.getvalue(transformed=False)
+                                        if param.name == "cenx":
+                                            valueset = (scalehst*(valueset - imghstshape[1]/2) + result.x[1]
+                                                        + sizeCutout/2)
+                                        elif param.name == "ceny":
+                                            valueset = (scalehst*(valueset - imghstshape[0]/2) + result.x[2]
+                                                        + sizeCutout/2)
+                                        elif param.name == "ang":
+                                            valueset += np.degrees(anglehst)
+                                        elif param.name == "re":
+                                            valueset *= scalehst
+                                        param.setvalue(valueset, transformed=False)
+                                    exposuremodel = modeltouse.data.exposures[bandhst][0]
+                                    exposuremodel.image = proutil.ImageEmpty((sizeCutout, sizeCutout))
+                                    # Save the GalSim model object
+                                    modeltouse.evaluate(keepmodels=True, getlikelihood=False, drawimage=False)
+                                    img = gs.Convolve(exposuremodel.meta['model'], imgpsfgs).drawImage(
+                                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc)*fluxscale
+
+                                noisetoadd = np.random.normal(scale=np.sqrt(var))
+                                img += noisetoadd
+
                                 if args.plot:
                                     fig2, ax2 = plt.subplots(nrows=2, ncols=3)
                                     ax2[0, 0].imshow(np.log10(cutouthsc[0]))
@@ -654,19 +719,18 @@ if __name__ == '__main__':
                                             result.x[1], result.x[2]
                                         ), imgpsfgs).drawImage(
                                         nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
+                                    imghst2hsc += noisetoadd
                                     imgs = (img.array, "my naive"), (imghst2hsc.array, "GS RealGal")
-                                    noisetoadd = np.sqrt(var)
                                     descpre = "HST {} - {}"
                                     for imgidx, (imgit, desc) in enumerate(imgs):
                                         ax2[1, 1+imgidx].imshow(np.log10(imgit))
                                         ax2[1, 1+imgidx].set_title(descpre.format(bandhst, desc))
-                                        imgit += np.random.normal(scale=noisetoadd)
                                         ax2[0, 1 + imgidx].imshow(np.log10(imgit))
                                         ax2[0, 1 + imgidx].set_title((descpre + " + noise").format(
                                             bandhst, desc))
 
                                 sigmainverse = 1.0/np.sqrt(var)
-                                # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image
+                                # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image/model
                                 psf = gs.InterpolatedImage(gs.Convolve(
                                     imgpsfgs, psfhst.rotate(anglehst*gs.degrees)).drawImage(
                                     nx=imgpsf.shape[1], ny=imgpsf.shape[0], scale=scalehscpsf)
@@ -704,15 +768,26 @@ if __name__ == '__main__':
                                 fit["fitinfo"]["log"] = None
                                 if hasattr(fit["result"], "problem"):
                                     fit["result"] = None
-                    data[id] = {"models": models, "fits": fits, "psfmodels": psfmodels}
+                    if id not in data:
+                        data[id] = {}
+                    data[id][srcname] = {"models": models, "fits": fits, "psfmodels": psfmodels}
             except Exception as e:
                 print("Error fitting id={}:".format(id))
                 print(e)
                 trace = traceback.format_exc()
                 print(trace)
-                data[id] = e, trace
+                if src is not None:
+                    if id not in data:
+                        data[id] = {}
+                    data[id][srcname] = e, trace
 
             nfit += 1
             if args.fileout is not None and (nfit % 10) == 0:
                 with open(os.path.expanduser(args.fileout), 'wb') as f:
                     pickle.dump(data, f)
+
+    if args.fileout is not None:
+        with open(os.path.expanduser(args.fileout), 'wb') as f:
+            pickle.dump(data, f)
+    if args.plot:
+        input("Press Enter to finish")
