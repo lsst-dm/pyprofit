@@ -202,7 +202,8 @@ class Model:
 
     def evaluate(self, params=None, data=None, bands=None, engine=None, engineopts=None,
                  paramstransformed=True, getlikelihood=True, likelihoodlog=True, keeplikelihood=False,
-                 keepimages=False, plot=False, figure=None, axes=None, figurerow=None, modelname="Model"):
+                 keepimages=False, keepmodels=False, plot=False, figure=None, axes=None, figurerow=None,
+                 modelname="Model", drawimage=True, scale=1):
         """
             Get the likelihood and/or model images
         """
@@ -256,9 +257,12 @@ class Model:
         for band in bands:
             # TODO: Check band
             for exposure in data.exposures[band]:
-                image = self.getexposuremodel(exposure, engine=engine, engineopts=engineopts)
+                image, model = self.getexposuremodel(exposure, engine=engine, engineopts=engineopts,
+                                                     drawimage=drawimage, scale=scale)
                 if keepimages:
                     exposure.meta["modelimage"] = np.array(image)
+                if keepmodels:
+                    exposure.meta["model"] = model
                 if getlikelihood or plot:
                     if plot:
                         figaxes = (figure, axes[figurerow])
@@ -434,9 +438,11 @@ class Model:
         return likelihood, chi, chilog, chiclip, imgclips[0], imgclips[1]
 
 
-    def getexposuremodel(self, exposure, engine=None, engineopts=None):
+    def getexposuremodel(self, exposure, engine=None, engineopts=None, drawimage=True, scale=1):
         """
             Draw model image for one exposure with one PSF
+
+            Returns the image and the engine-dependent model used to draw it
         """
         if engine is None:
             engine = self.engine
@@ -534,7 +540,9 @@ class Model:
 
             if exposure.calcinvmask is not None:
                 profit_model['calcmask'] = exposure.calcinvmask
-            image = np.array(pyp.make_model(profit_model)[0])
+            if drawimage:
+                image = np.array(pyp.make_model(profit_model)[0])
+            model = profit_model
         elif engine == "galsim":
             profilesgs = {
                 True: {"small": None, "big": None},
@@ -590,6 +598,7 @@ class Model:
                     raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
                         exposure.band))
                 profilesgs[True] = None
+                model = profilesgs[False]
             if self.engineopts is not None and "drawmethod" in self.engineopts:
                 method = self.engineopts["drawmethod"]
             else:
@@ -599,9 +608,13 @@ class Model:
             try:
                 haspsfimage = haspsf and psfgs is None and profilesgs[True] is not None
                 if haspsfimage:
-                    imagegs = profilesgs[True].drawImage(method="no_pixel", nx=nx, ny=ny, scale=1)
+                    model = profilesgs[True]
+                    if drawimage:
+                        imagegs = profilesgs[True].drawImage(method="no_pixel", nx=nx, ny=ny, scale=scale)
                     if profilesgs[False] is not None:
-                        imagegs += profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=1)
+                        model += profilesgs[False]
+                        if drawimage:
+                            imagegs += profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
                 else:
                     if profilesgs[True] is not None:
                         if profilesgs[False] is not None:
@@ -610,14 +623,16 @@ class Model:
                             profilesgs = profilesgs[True]
                     else:
                         profilesgs = profilesgs[False]
-                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=1)
+                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                    model = profilesgs
             except RuntimeError as e:
                 if method == "fft":
                     if haspsfimage:
-                        imagegs = profilesgs[True].drawImage(method="real_space", nx=nx, ny=ny, scale=1) + \
-                                  profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=1)
+                        imagegs = profilesgs[True].drawImage(method="real_space",
+                                                             nx=nx, ny=ny, scale=scale) + \
+                                  profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
                     else:
-                        imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=1)
+                        imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=scale)
                 else:
                     raise e
             except Exception as e:
@@ -631,7 +646,7 @@ class Model:
                 type(self), sumnotfinite, np.prod(image.shape)
             ))
 
-        return image
+        return image, model
 
     def getlimits(self, free=True, fixed=True, transformed=True):
         params = self.getparameters(free=free, fixed=fixed)
@@ -1262,6 +1277,7 @@ class MultiGaussianApproximationProfile(Component):
         "luv": mandatoryshape + ["re"],
     }
 
+    # From Hogg & Lang 13: http://adsabs.harvard.edu/abs/2013PASP..125..719H
     weights = {
         1: {
             4: (normalize(np.array([0.09733, 1.12804, 4.99846, 5.63632])),
