@@ -90,7 +90,9 @@ class Data:
 
 class PSF:
     """
-        Either a model or an image.
+        Either a model or an image. The model can be non-pixellated - i.e. a function describing the PDF of
+        photons scattering to a given position from their origin - or pixellated - i.e. a function
+        describing the convolution of the PSF with a pixel at a given position.
 
         Has convenience functions to convert to/from galsim format.
     """
@@ -143,10 +145,11 @@ class PSF:
             self.engine = engine
         return self.image
 
-    def __init__(self, band, image=None, model=None, engine=None, usemodel=False):
+    def __init__(self, band, image=None, model=None, engine=None, usemodel=False, modelpixelated=False):
         self.band = band
         self.model = model
         self.image = image
+        self.modelpixelated = modelpixelated
         if model is None:
             if image is None:
                 raise ValueError("PSF must be initialized with either a model or engine but both are none")
@@ -157,8 +160,8 @@ class PSF:
                 self.engine = engine
             else:
                 if not isinstance(image, np.ndarray):
-                    raise ValueError("PSF image must be an ndarray or galsim.Image/galsim.InterpolatedImage if "
-                                     "using galsim")
+                    raise ValueError("PSF image must be an ndarray or galsim.Image/galsim.InterpolatedImage"
+                                     " if using galsim")
                 self.engine = "libprofit"
                 self.image = self.getimage(engine=engine)
         else:
@@ -203,10 +206,13 @@ class Model:
     def evaluate(self, params=None, data=None, bands=None, engine=None, engineopts=None,
                  paramstransformed=True, getlikelihood=True, likelihoodlog=True, keeplikelihood=False,
                  keepimages=False, keepmodels=False, plot=False, figure=None, axes=None, figurerow=None,
-                 modelname="Model", drawimage=True, scale=1):
+                 modelname="Model", drawimage=True, scale=1, clock=False):
         """
             Get the likelihood and/or model images
         """
+        times = {}
+        if clock:
+            timenow = time.time()
         if engine is None:
             engine = self.engine
         Model._checkengine(engine)
@@ -254,6 +260,10 @@ class Model:
         chiimgs = []
         imgclips = []
         modelclips = []
+        if clock:
+            times["setup"] = timenow - time.time()
+            timenow = time.time()
+
         for band in bands:
             # TODO: Check band
             for exposure in data.exposures[band]:
@@ -288,13 +298,15 @@ class Model:
                             imgclips.append(imgclip)
                             modelclips.append(modelclip)
             # Color images! whooo
+            if clock:
+                times[band] = timenow - time.time()
+                timenow = time.time()
         if plot:
+            # TODO:
             if plotslen == 3:
                 self.plotexposurescolor(imgclips, modelclips, chis, chiimgs,
                                         chiclips, (figure, axes[figurerow]))
-            plt.tight_layout()
-            plt.subplots_adjust(wspace=0.05, hspace=0.05)
-        return likelihood, params, chis
+        return likelihood, params, chis, times
 
     def plotexposurescolor(self, images, modelimages, chis, chiimgs, chiclips, figaxes):
         # TODO: verify lengths
@@ -560,8 +572,9 @@ class Model:
                         profile["shear"]).shift(
                         profile["offset"] - cenimg)
                     convolve = haspsf and not profile["pointsource"]
-                profiletype = "all" if not convolve else ("small" if profilegs.original.half_light_radius <
-                                                                     1 else "big")
+                # TODO: Revise this when image scales are taken into account
+                profiletype = "all" if not convolve else ("big" if profilegs.original.half_light_radius > 1
+                                                          else "small")
                 if profilesgs[convolve][profiletype] is None:
                     profilesgs[convolve][profiletype] = profilegs
                 else:
@@ -599,10 +612,16 @@ class Model:
                         exposure.band))
                 profilesgs[True] = None
                 model = profilesgs[False]
-            if self.engineopts is not None and "drawmethod" in self.engineopts:
-                method = self.engineopts["drawmethod"]
+            # TODO: test this, and make sure that it works in all cases, not just gauss. mix
+            # Has a PSF and it's a pixelated analytic model, so all sources must use no_pixel
+            if haspsf and psfgs is not None and exposure.psf.modelpixelated:
+                method = "no_pixel"
             else:
-                method = "fft"
+                if (self.engineopts is not None and "drawmethod" in self.engineopts and
+                        self.engineopts["drawmethod"] is not None):
+                    method = self.engineopts["drawmethod"]
+                else:
+                    method = "fft"
             # Has a PSF, but it's not an analytic model, so it must be an image and therefore pixel
             # convolution is already included for extended objects, which must use no_pixel
             try:
@@ -623,7 +642,8 @@ class Model:
                             profilesgs = profilesgs[True]
                     else:
                         profilesgs = profilesgs[False]
-                    imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                    if drawimage:
+                        imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
                     model = profilesgs
             except RuntimeError as e:
                 if method == "fft":
@@ -1278,7 +1298,13 @@ class MultiGaussianApproximationProfile(Component):
     }
 
     # From Hogg & Lang 13: http://adsabs.harvard.edu/abs/2013PASP..125..719H
+    # TODO: review these; could they be improved? Clearly large deV needs more components regardless
     weights = {
+        0.5: {
+            4: (np.array([1]), np.array([1])),
+            6: (np.array([1]), np.array([1])),
+            8: (np.array([1]), np.array([1])),
+        },
         1: {
             4: (normalize(np.array([0.09733, 1.12804, 4.99846, 5.63632])),
                 np.array([0.12068, 0.32730, 0.68542, 1.28089])),
@@ -1327,7 +1353,11 @@ class MultiGaussianApproximationProfile(Component):
                     "Asked for EllipticalProfile (profile={:s}, name={:s}) model for band={:s} not in "
                     "bands with fluxes {}".format(self.profile, self.name, band, fluxesbands))
 
-        profiles = [{} for _ in range(self.order)]
+        profile = {param.name: param.getvalue(transformed=False) for param in
+                   self.parameters.values()}
+        keyweight = profile["nser"] if self.profile == "sersic" else self.profile
+        weightsprofile = MultiGaussianApproximationProfile.weights[keyweight][self.order]
+        profiles = [{} for _ in range(len(weightsprofile[0]))]
         for band in bandfluxes.keys():
             flux = fluxesbands[band].getvalue(transformed=False)
             if fluxesbands[band].isfluxratio:
@@ -1338,8 +1368,6 @@ class MultiGaussianApproximationProfile(Component):
                 # bandfluxes[band] -= flux
                 # TODO: Is subtracting as above best? Should be more accurate, but mightn't guarantee flux>=0
                 bandfluxes[band] *= (1.0-fluxratio)
-            profile = {param.name: param.getvalue(transformed=False) for param in
-                       self.parameters.values()}
             if not 0 < profile["axrat"] <= 1:
                 if profile["axrat"] > 1:
                     profile["axrat"] = 1
@@ -1365,8 +1393,6 @@ class MultiGaussianApproximationProfile(Component):
             profile["pointsource"] = False
             profile["resolved"] = True
 
-            keyweight = profile["nser"] if self.profile == "sersic" else self.profile
-            weightsprofile = MultiGaussianApproximationProfile.weights[keyweight][self.order]
             for subcomp, (weight, sigma) in enumerate(zip(weightsprofile[0], weightsprofile[1])):
                 weightprofile = copy.copy(profile)
                 re = profile["re"]*sigma
