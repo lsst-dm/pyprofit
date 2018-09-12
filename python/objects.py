@@ -466,199 +466,204 @@ class Model:
         ny, nx = exposure.image.shape
         band = exposure.band
         profiles = self.getprofiles([band], engine=engine)
+        if profiles:
+            haspsf = exposure.psf is not None
+            allgaussian = (
+                haspsf and exposure.psf.model is not None and
+                all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and
+                any([comp.isgaussian() for comps in [src.modelphotometric.components for src in self.sources]
+                     for comp in comps]))
+            if allgaussian:
+                # Note that libprofit uses the irritating GALFIT convention, so reverse that
+                varsgauss = ["ang", "axrat", "re"]
+                covarprofilessrc = [(getprofilegausscovar
+                                     (**{var: profile[band][var] + 90*(var == "ang") for var in varsgauss}) if
+                                     profile[band]["nser"] == 0.5 else None,
+                                     profile[band]) for
+                                    profile in self.getprofiles([band], engine="libprofit")]
 
-        haspsf = exposure.psf is not None
-        allgaussian = (
-            haspsf and exposure.psf.model is not None and
-            all([comp.isgaussian() for comp in exposure.psf.model.modelphotometric.components]) and
-            any([comp.isgaussian() for comps in [src.modelphotometric.components for src in self.sources]
-                 for comp in comps]))
-        if allgaussian:
-            # Note that libprofit uses the irritating GALFIT convention, so reverse that
-            varsgauss = ["ang", "axrat", "re"]
-            covarprofilessrc = [(getprofilegausscovar
-                                 (**{var: profile[band][var] + 90*(var == "ang") for var in varsgauss}) if
-                                 profile[band]["nser"] == 0.5 else None,
-                                 profile[band]) for
-                                profile in self.getprofiles([band], engine="libprofit")]
-
-            profilesnew = []
-            for idxpsf, profilepsf in enumerate(exposure.psf.model.getprofiles(
-                    bands=[band], engine="libprofit")):
-                fluxfrac = 10**(-0.4*profilepsf[band]["mag"])
-                covarpsf = getprofilegausscovar(**{var: profilepsf[band][var] + 90*(var == "ang") for
-                                                   var in varsgauss})
-                for idxsrc, (covarsrc, profile) in enumerate(covarprofilessrc):
-                    if covarsrc is not None:
-                        eigenvals, eigenvecs = np.linalg.eig(covarpsf + covarsrc)
-                        indexmaj = np.argmax(eigenvals)
-                        fwhm = np.sqrt(eigenvals[indexmaj])
-                        axrat = np.sqrt(eigenvals[1-indexmaj])/fwhm
-                        ang = np.degrees(np.arctan2(eigenvecs[1, indexmaj], eigenvecs[0, indexmaj]))
-                        if engine == "libprofit":
-                            profile["re"] = fwhm/2.0
-                            profile["axrat"] = axrat
-                            profile["flux"] *= fluxfrac
-                            profile["ang"] = ang
+                profilesnew = []
+                for idxpsf, profilepsf in enumerate(exposure.psf.model.getprofiles(
+                        bands=[band], engine="libprofit")):
+                    fluxfrac = 10**(-0.4*profilepsf[band]["mag"])
+                    covarpsf = getprofilegausscovar(**{var: profilepsf[band][var] + 90*(var == "ang") for
+                                                       var in varsgauss})
+                    for idxsrc, (covarsrc, profile) in enumerate(covarprofilessrc):
+                        if covarsrc is not None:
+                            eigenvals, eigenvecs = np.linalg.eig(covarpsf + covarsrc)
+                            indexmaj = np.argmax(eigenvals)
+                            fwhm = np.sqrt(eigenvals[indexmaj])
+                            axrat = np.sqrt(eigenvals[1-indexmaj])/fwhm
+                            ang = np.degrees(np.arctan2(eigenvecs[1, indexmaj], eigenvecs[0, indexmaj]))
+                            if engine == "libprofit":
+                                profile["re"] = fwhm/2.0
+                                profile["axrat"] = axrat
+                                profile["flux"] *= fluxfrac
+                                profile["ang"] = ang
+                            else:
+                                profile = {
+                                    "profile": gs.Gaussian(flux=10**(-0.4*profile["mag"])*fluxfrac,
+                                                           fwhm=fwhm*np.sqrt(axrat), gsparams=gsparams),
+                                    "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=ang*gs.degrees),
+                                    "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
+                                }
+                            profile["pointsource"] = True
+                            profile["resolved"] = True
+                            profile = {band: profile}
                         else:
-                            profile = {
-                                "profile": gs.Gaussian(flux=10**(-0.4*profile["mag"])*fluxfrac,
-                                                       fwhm=fwhm*np.sqrt(axrat), gsparams=gsparams),
-                                "shear": gs.Shear(g=(1.-axrat)/(1.+axrat), beta=ang*gs.degrees),
-                                "offset": gs.PositionD(profile["cenx"], profile["ceny"]),
-                            }
+                            profile = profiles[idxsrc]
+                        if covarsrc is not None or idxpsf == 0:
+                            profilesnew.append(profile)
+                profiles = profilesnew
+
+            if engine == "libprofit":
+                profilespro = {}
+                for profile in profiles:
+                    profile = profile[band]
+                    profiletype = profile["profile"]
+                    if profiletype not in profilespro:
+                        profilespro[profiletype] = []
+                    del profile["profile"]
+                    if not profile["pointsource"]:
+                        profile["convolve"] = haspsf
+                        if not profile["resolved"]:
+                            raise RuntimeError("libprofit can't handle non-point sources that aren't resolved"
+                                               "(i.e. profiles with size==0)")
+                    del profile["pointsource"]
+                    del profile["resolved"]
+                    # TODO: Find a better way to do this
+                    for coord in ["x", "y"]:
+                        nameold = "cen" + coord
+                        profile[coord + "cen"] = profile[nameold]
+                        del profile[nameold]
+                    profilespro[profiletype] += [profile]
+
+                profit_model = {
+                    'width': nx,
+                    'height': ny,
+                    'magzero': 0.0,
+                    'profiles': profilespro,
+                }
+                if haspsf:
+                    shape = exposure.psf.getimageshape()
+                    if shape is None:
+                        shape = [1 + np.int(x/2) for x in np.floor([nx, ny])]
+                    profit_model["psf"] = exposure.psf.getimage(engine, size=shape, engineopts=engineopts)
+
+                if exposure.calcinvmask is not None:
+                    profit_model['calcmask'] = exposure.calcinvmask
+                if drawimage:
+                    image = np.array(pyp.make_model(profit_model)[0])
+                model = profit_model
+            elif engine == "galsim":
+                profilesgs = {
+                    True: {"small": None, "big": None},
+                    False: {"all": None},
+                }
+                cenimg = gs.PositionD(nx/2., ny/2.)
+                for profile in profiles:
+                    profile = profile[band]
+                    if not profile["pointsource"] and not profile["resolved"]:
                         profile["pointsource"] = True
-                        profile["resolved"] = True
-                        profile = {band: profile}
+                        raise RuntimeError("Converting small profiles to point sources not implemented yet")
+                        # TODO: Finish this
                     else:
-                        profile = profiles[idxsrc]
-                    if covarsrc is not None or idxpsf == 0:
-                        profilesnew.append(profile)
-            profiles = profilesnew
-
-        if engine == "libprofit":
-            profilespro = {}
-            for profile in profiles:
-                profile = profile[band]
-                profiletype = profile["profile"]
-                if profiletype not in profilespro:
-                    profilespro[profiletype] = []
-                del profile["profile"]
-                if not profile["pointsource"]:
-                    profile["convolve"] = haspsf
-                    if not profile["resolved"]:
-                        raise RuntimeError("libprofit can't handle non-point sources that aren't resolved"
-                                           "(i.e. profiles with size==0)")
-                del profile["pointsource"]
-                del profile["resolved"]
-                # TODO: Find a better way to do this
-                for coord in ["x", "y"]:
-                    nameold = "cen" + coord
-                    profile[coord + "cen"] = profile[nameold]
-                    del profile[nameold]
-                profilespro[profiletype] += [profile]
-
-            profit_model = {
-                'width': nx,
-                'height': ny,
-                'magzero': 0.0,
-                'profiles': profilespro,
-            }
-            if haspsf:
-                shape = exposure.psf.getimageshape()
-                if shape is None:
-                    shape = [1 + np.int(x/2) for x in np.floor([nx, ny])]
-                profit_model["psf"] = exposure.psf.getimage(engine, size=shape, engineopts=engineopts)
-
-            if exposure.calcinvmask is not None:
-                profit_model['calcmask'] = exposure.calcinvmask
-            if drawimage:
-                image = np.array(pyp.make_model(profit_model)[0])
-            model = profit_model
-        elif engine == "galsim":
-            profilesgs = {
-                True: {"small": None, "big": None},
-                False: {"all": None},
-            }
-            cenimg = gs.PositionD(nx/2., ny/2.)
-            for profile in profiles:
-                profile = profile[band]
-                if not profile["pointsource"] and not profile["resolved"]:
-                    profile["pointsource"] = True
-                    raise RuntimeError("Converting small profiles to point sources not implemented yet")
-                    # TODO: Finish this
-                else:
-                    profilegs = profile["profile"].shear(
-                        profile["shear"]).shift(
-                        profile["offset"] - cenimg)
-                    convolve = haspsf and not profile["pointsource"]
-                # TODO: Revise this when image scales are taken into account
-                profiletype = "all" if not convolve else ("big" if profilegs.original.half_light_radius > 1
-                                                          else "small")
-                if profilesgs[convolve][profiletype] is None:
-                    profilesgs[convolve][profiletype] = profilegs
-                else:
-                    profilesgs[convolve][profiletype] += profilegs
-            profilesgs[False] = profilesgs[False]["all"]
-
-            if haspsf:
-                psfgs = exposure.psf.model
-                if psfgs is None:
-                    profilespsf = exposure.psf.getimage(engine=engine)
-                else:
-                    psfgs = psfgs.getprofiles(bands=[band], engine=engine)
-                    profilespsf = None
-                    for profile in psfgs:
-                        profile = profile[band]
-                        profilegs = profile["profile"].shear(profile["shear"])
-                        # TODO: Think about whether this would ever be necessary
-                        #.shift(profile["offset"] - cenimg)
-                        if profilespsf is None:
-                            profilespsf = profilegs
-                        else:
-                            profilespsf += profilegs
-                profilesgsconv = None
-                for sizebin, profilesbin in profilesgs[True].items():
-                    if profilesbin is not None:
-                        profilesbin = gs.Convolve(profilesbin, profilespsf, gsparams=gsparams)
-                        if profilesgsconv is None:
-                            profilesgsconv = profilesbin
-                        else:
-                            profilesgsconv += profilesbin
-                profilesgs[True] = profilesgsconv
-            else:
-                if any([x is not None for x in profilesgs[True].values()]):
-                    raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
-                        exposure.band))
-                profilesgs[True] = None
-                model = profilesgs[False]
-            # TODO: test this, and make sure that it works in all cases, not just gauss. mix
-            # Has a PSF and it's a pixelated analytic model, so all sources must use no_pixel
-            if haspsf and psfgs is not None and exposure.psf.modelpixelated:
-                method = "no_pixel"
-            else:
-                if (self.engineopts is not None and "drawmethod" in self.engineopts and
-                        self.engineopts["drawmethod"] is not None):
-                    method = self.engineopts["drawmethod"]
-                else:
-                    method = "fft"
-            # Has a PSF, but it's not an analytic model, so it must be an image and therefore pixel
-            # convolution is already included for extended objects, which must use no_pixel
-            try:
-                haspsfimage = haspsf and psfgs is None and profilesgs[True] is not None
-                if haspsfimage:
-                    model = profilesgs[True]
-                    if drawimage:
-                        imagegs = profilesgs[True].drawImage(method="no_pixel", nx=nx, ny=ny, scale=scale)
-                    if profilesgs[False] is not None:
-                        model += profilesgs[False]
-                        if drawimage:
-                            imagegs += profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
-                else:
-                    if profilesgs[True] is not None:
-                        if profilesgs[False] is not None:
-                            profilesgs = profilesgs[True] + profilesgs[False]
-                        else:
-                            profilesgs = profilesgs[True]
+                        profilegs = profile["profile"].shear(
+                            profile["shear"]).shift(
+                            profile["offset"] - cenimg)
+                        convolve = haspsf and not profile["pointsource"]
+                    # TODO: Revise this when image scales are taken into account
+                    profiletype = ("all" if not convolve else
+                        ("big" if profilegs.original.half_light_radius > 1 else "small"))
+                    if profilesgs[convolve][profiletype] is None:
+                        profilesgs[convolve][profiletype] = profilegs
                     else:
-                        profilesgs = profilesgs[False]
-                    if drawimage:
-                        imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
-                    model = profilesgs
-            except RuntimeError as e:
-                if method == "fft":
+                        profilesgs[convolve][profiletype] += profilegs
+                profilesgs[False] = profilesgs[False]["all"]
+
+                if haspsf:
+                    psfgs = exposure.psf.model
+                    if psfgs is None:
+                        profilespsf = exposure.psf.getimage(engine=engine)
+                    else:
+                        psfgs = psfgs.getprofiles(bands=[band], engine=engine)
+                        profilespsf = None
+                        for profile in psfgs:
+                            profile = profile[band]
+                            profilegs = profile["profile"].shear(profile["shear"])
+                            # TODO: Think about whether this would ever be necessary
+                            #.shift(profile["offset"] - cenimg)
+                            if profilespsf is None:
+                                profilespsf = profilegs
+                            else:
+                                profilespsf += profilegs
+                    profilesgsconv = None
+                    for sizebin, profilesbin in profilesgs[True].items():
+                        if profilesbin is not None:
+                            profilesbin = gs.Convolve(profilesbin, profilespsf, gsparams=gsparams)
+                            if profilesgsconv is None:
+                                profilesgsconv = profilesbin
+                            else:
+                                profilesgsconv += profilesbin
+                    profilesgs[True] = profilesgsconv
+                else:
+                    if any([x is not None for x in profilesgs[True].values()]):
+                        raise RuntimeError("Model (band={}) has profiles to convolve but no PSF".format(
+                            exposure.band))
+                    profilesgs[True] = None
+                    model = profilesgs[False]
+                # TODO: test this, and make sure that it works in all cases, not just gauss. mix
+                # Has a PSF and it's a pixelated analytic model, so all sources must use no_pixel
+                if haspsf and psfgs is not None and exposure.psf.modelpixelated:
+                    method = "no_pixel"
+                else:
+                    if (self.engineopts is not None and "drawmethod" in self.engineopts and
+                            self.engineopts["drawmethod"] is not None):
+                        method = self.engineopts["drawmethod"]
+                    else:
+                        method = "fft"
+                # Has a PSF, but it's not an analytic model, so it must be an image and therefore pixel
+                # convolution is already included for extended objects, which must use no_pixel
+                try:
+                    haspsfimage = haspsf and psfgs is None and profilesgs[True] is not None
                     if haspsfimage:
-                        imagegs = profilesgs[True].drawImage(method="real_space",
-                                                             nx=nx, ny=ny, scale=scale) + \
-                                  profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                        model = profilesgs[True]
+                        if drawimage:
+                            imagegs = profilesgs[True].drawImage(method="no_pixel", nx=nx, ny=ny, scale=scale)
+                        if profilesgs[False] is not None:
+                            model += profilesgs[False]
+                            if drawimage:
+                                imagegs += profilesgs[False].drawImage(method=method, nx=nx, ny=ny,
+                                                                       scale=scale)
                     else:
-                        imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=scale)
-                else:
+                        if profilesgs[True] is not None:
+                            if profilesgs[False] is not None:
+                                profilesgs = profilesgs[True] + profilesgs[False]
+                            else:
+                                profilesgs = profilesgs[True]
+                        else:
+                            profilesgs = profilesgs[False]
+                        if drawimage:
+                            imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                        model = profilesgs
+                except RuntimeError as e:
+                    if method == "fft":
+                        if haspsfimage:
+                            imagegs = profilesgs[True].drawImage(method="real_space",
+                                                                 nx=nx, ny=ny, scale=scale) + \
+                                      profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                        else:
+                            imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=scale)
+                    else:
+                        raise e
+                except Exception as e:
                     raise e
-            except Exception as e:
-                raise e
-            # TODO: Determine why this is necessary. Should we keep an imageD per exposure?
-            image = np.copy(imagegs.array)
+                # TODO: Determine why this is necessary. Should we keep an imageD per exposure?
+                if drawimage:
+                    image = np.copy(imagegs.array)
+
+        if not drawimage:
+            return None, model
 
         sumnotfinite = np.sum(~np.isfinite(image))
         if sumnotfinite > 0:
@@ -690,10 +695,14 @@ class Model:
             profiles += src.getprofiles(engine=engine, bands=bands, engineopts=engineopts)
         return profiles
 
-    def getparameters(self, free=True, fixed=True):
+    def getparameters(self, free=True, fixed=True, flatten=True):
         params = []
         for src in self.sources:
-            params += src.getparameters(free=free, fixed=fixed)
+            paramssrc = src.getparameters(free=free, fixed=fixed, flatten=flatten)
+            if flatten:
+                params += paramssrc
+            else:
+                params.append(paramssrc)
         return params
 
     def getparamnames(self, free=True, fixed=True):
@@ -720,7 +729,7 @@ class Model:
         likelihood = self.evaluate(params, data, likelihoodlog=log, **kwargs)[0]
         return likelihood
 
-    def __init__(self, sources, data=None, likefunc="normal", engine=None, engineopts=None):
+    def __init__(self, sources, data=None, likefunc="normal", engine=None, engineopts=None, name=""):
         if engine is None:
             engine = "libprofit"
         for i, source in enumerate(sources):
@@ -740,6 +749,7 @@ class Model:
         self.engine = engine
         self.engineopts = engineopts
         self.likefunc = likefunc
+        self.name = name
 
 
 class ModellerPygmoUDP:
@@ -948,10 +958,19 @@ class Source:
         if engine not in Model.ENGINES:
             raise ValueError("Unknown {:s} rendering engine {:s}".format(type(cls), engine))
 
-    def getparameters(self, free=None, fixed=None, time=None):
+    def getparameters(self, free=None, fixed=None, flatten=True, time=None):
         astrometry = self.modelastrometric.getposition(time)
-        return self.modelastrometric.getparameters(free, fixed, time) + \
-            self.modelphotometric.getparameters(free, fixed, astrometry=astrometry)
+        paramobjects = [
+            self.modelastrometric.getparameters(free, fixed, time),
+            self.modelphotometric.getparameters(free, fixed, flatten=flatten, astrometry=astrometry)
+        ]
+        params = []
+        for paramobject in paramobjects:
+            if flatten:
+                params += paramobject
+            else:
+                params.append(paramobject)
+        return params
 
     # TODO: Finish this
     def getparamnames(self, free=None, fixed=None):
@@ -971,11 +990,16 @@ class Source:
 
 
 class PhotometricModel:
-    def getparameters(self, free=True, fixed=True, astrometry=None):
-        params = [flux for flux in self.fluxes.values() if
-                  (flux.fixed and fixed) or (not flux.fixed and free)]
+    def getparameters(self, free=True, fixed=True, flatten=True, astrometry=None):
+        paramsflux = [flux for flux in self.fluxes.values() if
+                      (flux.fixed and fixed) or (not flux.fixed and free)]
+        params = paramsflux if flatten else [paramsflux]
         for comp in self.components:
-            params += comp.getparameters(free=free, fixed=fixed)
+            paramscomp = comp.getparameters(free=free, fixed=fixed)
+            if flatten:
+                params += paramscomp
+            else:
+                params.append(paramscomp)
         return params
 
     # TODO: Determine how the astrometric model is supposed to interact here
