@@ -2,8 +2,10 @@ import argparse
 import astropy as ap
 from collections import OrderedDict
 import copy
+import csv
 import galsim as gs
 import inspect
+import io
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,7 +20,7 @@ import pyprofit.python.objects as proobj
 import pyprofit.python.util as proutil
 
 options = {
-    "algos":       {"default": {"scipy": "L-BFGS-B", "pygmo": "lbfgs"}},
+    "algos":       {"default": {"scipy": "BFGS", "pygmo": "lbfgs"}},
     "backgrounds": {"default": [1.e3]},
     "engines":     {"avail": ["galsim", "libprofit"], "default": "galsim"},
     "bands":       {"default": [""]},
@@ -34,13 +36,12 @@ options = {
     "psfsizes":    {"default": [21]},
     "psffit":      {"default": False},
     "psfmodeluse": {"default": False},
-    "psfoptlib":   {"default": "pygmo"},
-    "psfoptalgo":  {"default": "neldermead"},
 }
 
 
 # Fairly standard moment of inertia estimate of ellipse orientation and size
 # TODO: compare with galsim's convenient calculateHLR/FWHM
+# TODO: replace with the stack's method (in meas_?)
 def getellipseestimate(img, denoise=True):
     imgmeas = proutil.absconservetotal(np.copy(img)) if denoise else img
     y, x = np.nonzero(imgmeas)
@@ -61,57 +62,7 @@ def getellipseestimate(img, denoise=True):
     return axrat, ang, np.sqrt(evals[idxevalmax]/np.sum(flux))
 
 
-def getchisqred(chis):
-    chisum = 0
-    chicount = 0
-    for chivals in chis:
-        chisum += np.sum(chivals**2)
-        chicount += len(chivals)**2
-    return chisum/chicount
-
-
-def fitmodel(model, modeller=None, modellib=None, modellibopts=None, printfinal=True, printsteps=100,
-             plot=False, modelname=None, figure=None, title=None,
-             axes=None, figurerow=None, modelnameappendparams=None):
-    if modeller is None:
-        modeller = proobj.Modeller(model=model, modellib=modellib, modellibopts=modellibopts)
-    fit = modeller.fit(printfinal=printfinal, printsteps=printsteps)
-    # Conveniently sets the parameters to the right values too
-    if plot:
-        modeldesc = modelname
-        if modelnameappendparams is not None:
-            for string, param in modelnameappendparams:
-                modeldesc += string.format(param.getvalue(transformed=False))
-        plt.show(block=False)
-    else:
-        modeldesc = None
-    _, _, chis = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modeldesc, figure=figure,
-                                axes=axes, figurerow=figurerow)
-    if plot and title is not None:
-        plt.suptitle(title)
-    fit["chisqred"] = getchisqred(chis)
-    fit["paramsbestall"] = [param.getvalue(transformed=True) for param in model.getparameters()]
-    return fit, modeller
-
-
-def setexposure(model, band, image=None, sigmainverse=None, psf=None, mask=None, factorsigma=1):
-    exposure = model.data.exposures[band][0]
-    exposure.image = image
-    if psf is None and image is not None and sigmainverse is None:
-        sigmaimg = np.sqrt(np.var(image))
-        exposure.sigmainverse = 1.0/(factorsigma*sigmaimg)
-    else:
-        exposure.sigmainverse = sigmainverse
-    exposure.psf = psf
-    exposure.mask = mask
-    return model
-
-
-def getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psfimage, factorsigma=1):
-    if engine == "galsim":
-        engineopts = {"gsparams": gs.GSParams(kvalue_accuracy=1e-4,
-                                              integration_relerr=1e-4,
-                                              integration_abserr=1e-6)}
+def getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psfimage, sigmainverse=None, factorsigma=1):
     model = proutil.getmodel({band: 1}, psfmodel, np.flip(psfimage.shape, axis=0),
                              8.0 * 10 ** ((np.arange(numcomps) - numcomps / 2) / numcomps),
                              np.repeat(0.8, numcomps),
@@ -120,323 +71,572 @@ def getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psfimage, factorsi
     for param in model.getparameters(fixed=False):
         if isinstance(param, proobj.FluxParameter) and not param.isfluxratio:
             param.fixed = True
-    setexposure(model, band, image=psfimage, factorsigma=factorsigma)
+    proutil.setexposure(model, band, image=psfimage, sigmainverse=sigmainverse, factorsigma=factorsigma)
     return model
 
 
-def fitgalaxy(img, psf, sigmainverse, band, mask=None, modellib=None, algo=None, plot=False, psfmodel=None,
-              dofullbulgedisk=False, factorsigmapsf=1, name=None,
-              modelsinitfrom=dict(
-                  #exp=["multiexp"],
-                  #dev=["multidev"],
-                  ser=["gauss", "exp", "dev"],
-              )):
+#            "multigaussiansersic:1,sersic:1": proutil.getmodel(
+#                {band: flux}, "multigaussiansersic:1,sersic:1", npiximg,
+#                             valuesinit["re"], valuesinit["axrat"], valuesinit["ang"],
+#                             offsetxy=offsetxy, engine=engine, engineopts=engineopts,
+                             #istransformedvalues=istransformedvalues, slopes=[np.log10(4.), 0])
+
+
+def getmodelspecs(filename=None):
+    if filename is None:
+        modelspecs = io.StringIO("\n".join([
+            ",".join(["name", "model", "fixedparams", "initparams", "inittype", "psfmodel", "psfpixel"]),
+            ",".join(["gausspix", "sersic:1", "nser", "nser=0.5", "moments", "gaussian:2", "T"]),
+            ",".join(["gauss", "sersic:1",  "nser", "nser=0.5", "moments", "gaussian:2", "F"]),
+            ",".join(["gaussinitpix ", "sersic:1", "nser", "", "gausspix", "gaussian:2", "F"]),
+        ]))
+    with modelspecs if filename is None else open(filename, 'r') as filecsv:
+        modelspecs = [row for row in csv.reader(filecsv)]
+    header = modelspecs[0]
+    del modelspecs[0]
+    return modelspecs, header
+
+
+def fitpsf(imgpsf, psfmodel, engines, band, sigmainverse=None, modellib="scipy",
+           modellibopts={'algo': 'Nelder-Mead'}, plot=False, title="", modelname="", printfinal=True,
+           printsteps=100):
+    psfmodels = {}
+    # Fit the PSF
+    numcomps = np.int(psfmodel.split(":")[1])
+    for engine, engineopts in engines.items():
+        model = getpsfmodel(engine, engineopts, numcomps, band, psfmodel, imgpsf,
+                            sigmainverse=sigmainverse)
+        fit = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts, printfinal=printfinal,
+                       printsteps=printsteps, plot=plot, title=title, modelname=modelname + " PSF")
+        psfmodels[engine] = {"model": model, "fit": fit}
+    return psfmodels
+
+
+def initmodelfrommodelfits(model, modelfits):
+    # This is going to be complicated, ugh
+    # TODO: Come up with a better structure for parameter
+    # TODO: Put this is utils as a generic init model from other model(s) method
+    chisqreds = [value['chisqred'] for value in modelfits]
+    modelbest = chisqreds.index(min(chisqreds))
+    paramtreebest = modelfits[modelbest]['paramtree']
+    fluxcensinit = paramtreebest[0][1][0] + paramtreebest[0][0]
+    # Get fluxes and components for init
+    fluxesinit = []
+    compsinit = []
+    for modelfit in modelfits:
+        paramtree = modelfit['paramtree']
+        for param, value in zip(modelfit['params'], modelfit['paramvals']):
+            param.setvalue(value, transformed=False)
+        for flux in paramtree[0][1][0]:
+            fluxesinit.append(flux)
+        for comp in paramtree[0][1][1:len(paramtree[0][1])]:
+            compsinit.append([(param, param.getvalue(transformed=False)) for param in comp])
+    params = model.getparameters(fixed=True, flatten=False)
+    # one source
+    paramssrc = params[0]
+    fluxcomps = paramssrc[1]
+    fluxcens = fluxcomps[0] + paramssrc[0]
+    comps = [comp for comp in fluxcomps[1:len(fluxcomps)]]
+    # Check if fluxcens all length three with a total flux parameter and two centers named
+    #  cenx and ceny
+    # TODO: More informative errors
+    for name, fluxcen in {"init": fluxcensinit, "new": fluxcens}.items():
+        if len(fluxcen) != 3:
+            raise RuntimeError("{} len(fluxcen[)={} != 3".format(name, len(fluxcen)))
+        fluxisflux = isinstance(fluxcen[0], proobj.FluxParameter)
+        if not fluxisflux or fluxcen[0].isfluxratio:
+            raise RuntimeError("{} fluxcen[0] (type={}) isFluxParameter={} or isfluxratio".format(
+                name, type(fluxcen[0]), fluxisflux))
+        if not (fluxcen[1].name == "cenx" and fluxcen[2].name == "ceny"):
+            raise RuntimeError("{}[1:2] names=({},{}) not ('cenx','ceny')".format(
+                name, fluxcen[1].name, fluxcen[2].name))
+    for paramset, paraminit in zip(fluxcens, fluxcensinit):
+        paramset.setvalue(paraminit.getvalue(transformed=False), transformed=False)
+    # Check if ncomps equal
+    if len(comps) != len(compsinit):
+        raise RuntimeError("Model {} has {} components but prereqs {} have a total of "
+                           "{}".format(model.name, len(comps), [x['modeltype'] for x in modelfits],
+                                       len(compsinit)))
+    for idxcomp, (compset, compinit) in enumerate(zip(comps, compsinit)):
+        if len(compset) != len(compinit):
+            # TODO: More informative error plz
+            raise RuntimeError("Comps not same length")
+        for paramset, (paraminit, value) in zip(compset, compinit):
+            if isinstance(paramset, proobj.FluxParameter):
+                # TODO: Should this be checked? Eventually we should override it smartly
+                ratio = paramset.getvalue(transformed=False)
+            else:
+                if type(paramset) != type(paraminit):
+                    # TODO: finish this
+                    raise RuntimeError("Param types don't match")
+                if paramset.name != paraminit.name:
+                    # TODO: warn or throw?
+                    pass
+                paramset.setvalue(value, transformed=False)
+
+
+def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
+              modellib=None, modellibopts=None, plot=False, name=None
+              ):
     """
 
     :param img: ndarray; 2D Image
-    :param psf: ndarray; 2D PSF Image
+    :param psfs: Collection of proutil.PSF object
     :param sigmainverse: ndarray; 2D Inverse sigma image ndarray
     :param band: string; Filter/passband name
     :param mask: ndarray; 2D Inverse mask image (1=include, 0=omit)
+    :param modelspecs: Model specifications as returned by getmodelspecs
     :param modellib: string; Model fitting library
-    :param algo: string; Fitting algorithm
-    :param plot: bool; make plots?
-    :param psfmodel: string; PSF model description e.g. "gaussian:2"
-    :param dofullbulgedisk: bool; Do full bulge-disk decomposition vs just CModel
-    :param factorsigmapsf: float; Factor to multiply the PSF sigma image by
-    :param modelsinitfrom: dict; key=model name: value=array of models to initialize from (selects best fit)
+    :param modellibopts: dict; Model fitting library options
+    :param plot: bool; Make plots?
+    :param name: string; Name of the model for plot labelling
 
-    :return: modelinfos, models, psfmodels: tuple of complicated structures:
+    :return: fitsbyengine, models: tuple of complicated structures:
         modelinfos: dict; key=model name: value=dict; TBD
         models: dict; key=engine name: value=dict(key=model type: value=proobj.Model of that type)
         psfmodels: dict: TBD
     """
-    axrat, ang, re = getellipseestimate(img.array)
+    initfrommoments = {name: value for name, value in zip(["axrat", "ang", "re"],
+                                                          getellipseestimate(img.array))}
     engines = {
         "galsim": {"gsparams": gs.GSParams(kvalue_accuracy=1e-2, integration_relerr=1e-2,
                                            integration_abserr=1e-3, maximum_fft_size=16384)}
     }
     title = name if plot else None
-    psfmodels = {}
-    # Fit the PSF
-    if psfmodel is not None:
-        numcomps = np.int(psfmodel.split(":")[1])
-        for engine, engineopts in engines.items():
-            model = getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psf.image.array,
-                                factorsigma=factorsigmapsf)
-            modeller = proobj.Modeller(model=model, modellib="pygmo", modellibopts={"algo": "neldermead"})
-            fit = fitmodel(model, modeller, printfinal=True, printsteps=100, plot=plot,
-                           title=title, modelname=psfmodel + " PSF")
-            psfmodels[engine] = {"model": model, "fit": fit}
-
     npiximg = np.flip(img.array.shape, axis=0)
     flux = np.sum(img.array[mask] if mask is not None else img.array)
-    models = {
-        engine: {
-            "sersic": proutil.getmodel({band: flux}, "gaussian:1", npiximg,
-                                       [re], [axrat], [ang], engine=engine, engineopts=engineopts),
-            "multigaussian": proutil.getmodel({band: flux}, "multigaussiansersic:1", npiximg,
-                                              [re], [axrat], [ang], slopes=[1.0], engine=engine,
-                                              engineopts=engineopts),
-        } for engine, engineopts in engines.items()
-    }
-    for engine, modelsbytype in models.items():
-        for modeltype, model in modelsbytype.items():
-            init = [param.getvalue(transformed=True) for param in model.getparameters(fixed=False)]
-            fixedinit = [param.fixed for param in model.getparameters()]
-            if psfmodel is None:
-                psfexposure = proobj.PSF(band=band, engine="galsim", image=psf)
-            else:
-                psfexposure = proobj.PSF(band=band, engine="galsim",
-                                         model=psfmodels[engine]["model"].sources[0])
-            setexposure(model, band, img.array, np.zeros(img.array.shape) + sigmainverse, psfexposure,
-                        mask=mask)
-            modeller = proobj.Modeller(model=model, modellib="scipy", modellibopts={"algo": "L-BFGS-B"})
-            models[engine][modeltype] = {
-                "fixedinit": fixedinit,
-                "init": init,
-                "model": model,
-                "modeller": modeller,
-            }
-
-    modelssersic = [
-        ("gauss", 0.5),
-        ("multiexp", 1.0),
-        ("exp", 1.0),
-        ("multidev", 4.0),
-        ("dev", 4.0),
-        ("ser", 2.0),
-        # ,
-        #,
-    ]
-    modelinfos = OrderedDict()
-    for model in modelssersic:
-        modelinfos[model[0]] = {"nser": model[1]}
-    errors = []
-    for model, modelsfrom in modelsinitfrom.items():
-        modelsinit = [modelfrom in modelsinitfrom for modelfrom in modelsfrom]
-        if any(modelsinit):
-            errors.append("Model {} initializes from models {} which also initialize from other models; "
-                          "resolving priority chains is not implemented yet".format(
-                             model, ",".join(np.array(modelsfrom)[modelsinit])))
-        modelinfos.move_to_end(model)
-    if errors:
-        # TODO: Fix this
-        print("Warnings: " + " && ".join(errors))
-        #raise RuntimeError("Errors: " + " && ".join(errors))
 
     maxvalues = {
         "re": np.sqrt(np.sum((npiximg/2.)**2)),
         "flux": 10*np.sum(img.array),
     }
-
-    for modelname in modelinfos:
-        modelinfos[modelname]["fits"] = {}
-    for engine in engines:
+    # TODO: validate specs
+    specs = {name: idx for idx, name in enumerate(modelspecs[1])}
+    models = {}
+    paramsfixeddefault = {}
+    fitsbyengine = {}
+    usemodellibdefault = modellibopts is None
+    for engine, engineopts in engines.items():
+        fitsbyengine[engine] = {}
+        fitsengine = fitsbyengine[engine]
         if plot:
-            # Will be used below
-            figurerow = len(modelinfos)
-            figure, axes = plt.subplots(nrows=figurerow+2, ncols=5)
+            nrows = len(modelspecs[0])
+            figure, axes = plt.subplots(nrows=nrows, ncols=5)
+            # This keeps things consistent with the nrows>1 case
+            if nrows == 1:
+                axes = np.array([axes])
             plt.suptitle(title + " {} model".format(engine))
         else:
-            figurerow = None
             figure = None
             axes = None
-        for modelidx, modelname in enumerate(modelinfos):
-            print("Fitting model {:s} using engine {:s}".format(modelname, engine))
-            sys.stdout.flush()
-            model = models[engine]
-            nser = modelinfos[modelname]["nser"]
-            if modelname.startswith("multi"):
-                model = model["multigaussian"]
+        for modelidx, modelinfo in enumerate(modelspecs[0]):
+            modelname = modelinfo[specs["name"]]
+            modeltype = modelinfo[specs["model"]]
+            if modeltype not in models:
+                models[modeltype] = proutil.getmodel(
+                    {band: flux}, modeltype, npiximg, engine=engine, engineopts=engineopts
+                    # offsetxy=offsetxy, ,
+                    # istransformedvalues=istransformedvalues, slopes=[np.log10(4.), 0]
+                )
+                paramsfixeddefault[modeltype] = [param.fixed for param in
+                                                 models[modeltype].getparameters(fixed=True)]
+            model = models[modeltype]
+            psfname = modelinfo[specs["psfmodel"]] + ("_pixelated" if proutil.str2bool(
+                modelinfo[specs["psfpixel"]]) else "")
+            proutil.setexposure(model, band, image=img.array, sigmainverse=sigmainverse, psf=psfs[psfname]["object"],
+                        mask=mask)
+            inittype = modelinfo[specs["inittype"]]
+            if inittype == "moments":
+                for param in model.getparameters(fixed=False):
+                    if param.name in initfrommoments:
+                        param.setvalue(initfrommoments[param.name], transformed=False)
             else:
-                model = model["sersic"]
-            fits = []
-            # Fit the position and re first
-            fixedinit = model["fixedinit"]
-            init = model["init"]
-            modeller = model["modeller"]
-            model = model["model"]
-            toinitfromother = modelname in modelsinitfrom
-            if toinitfromother:
-                # Check chisqred of reference models to find best model
-                modelchisqreds = {modelfit: modelinfos[modelfit]["fits"][engine][-1]["chisqred"]
-                                  for modelfit in modelsinitfrom[modelname]}
-                modelbest = min(modelchisqreds, key=modelchisqreds.get)
-                print("Model {} initializing from best-fit model={} chisqred={:.2e}".format(
-                    modelname, modelbest, modelchisqreds[modelbest]
-                ))
-                init = modelinfos[modelbest]["fits"][engine][-1]["paramsbestall"]
-            for value, param in zip(init, model.getparameters(fixed=toinitfromother)):
-                param.setvalue(value, transformed=True)
-                if param.name in maxvalues:
-                    param.limits = copy.deepcopy(param.limits)
-                    maxval = maxvalues[param.name]
-                    param.limits.upper = (param.transform.transform(maxval) if
-                                          param.limits.transformed else maxval)
-                if param.name == "re":
-                    if not toinitfromother and (modelname == "dev" or modelname == "multidev"):
-                        re = param.getvalue(transformed=False)
-                        param.setvalue(re*(1 + 0.25*((re < 1) + (re < 10))), transformed=False)
-                elif not (param.name == "cenx" or param.name == "ceny" or
-                          (param.name == "flux" and modelname == "dev")):
-                    param.fixed = True
-            for param in model.getparameters(free=False):
-                if param.name == "nser":
-                    if toinitfromother:
-                        param.fixed = False
+                # TODO: Refactor into function
+                if inittype.startswith("best"):
+                    if inittype == "best":
+                        modelnamecomps = []
+                        for modelidxcomp in range(modelidx):
+                            modelinfocomp = modelspecs[0][modelidxcomp]
+                            if modelinfocomp[specs["model"]] == modeltype:
+                                modelnamecomps.append(modelinfocomp[specs['name']])
                     else:
-                        param.setvalue(nser, transformed=False)
-            modeller.modellib = "scipy"
-            modeller.modellibopts["algo"] = "L-BFGS-B"
-            fit1, _ = fitmodel(model, modeller, printfinal=True, printsteps=100)
-            fits.append(fit1)
-            # Free fixed parameters as needed
-            for param, fixed in zip(model.getparameters(), fixedinit):
-                if param.name == "nser" and modelname == "ser":
-                    param.fixed = False
-                    paramser = param
+                        # TODO: Check this more thoroughly
+                        modelnamecomps = inittype.split(":")[1].split(";")
+                        print(modelnamecomps)
+                    chisqredbest = np.Inf
+                    for modelnamecomp in modelnamecomps:
+                        chisqred = fitsbyengine[engine][modelnamecomp]["fits"][-1]["chisqred"]
+                        if chisqred < chisqredbest:
+                            chisqredbest = chisqred
+                            inittype = modelnamecomp
                 else:
-                    param.fixed = fixed
-            #fit2, _ = fitmodel(model, modeller, printfinal=True, printsteps=100)
-            #fits.append(fit2)
-            modeller.modellib = "pygmo"
-            modeller.modellibopts["algo"] = "neldermead"
-            fit3, _ = fitmodel(model, modeller, printfinal=True, printsteps=100,
-                               plot=plot, figure=figure, axes=axes, figurerow=modelidx,
-                               modelname=modelname, modelnameappendparams=[(" n={:.2f}", paramser)] if
-                modelname == "ser" else [])
-            fits.append(fit3)
-            modelinfos[modelname]["fits"][engine] = fits
-    paramsinit = ["re", "axrat", "ang"]
-    fluxratmax = 0.99
-    fluxratmin = 0.01
-    for modelname in ["cmodel", "devexp", "serexp", "serser"]:
-        modelinfos[modelname] = {"fits": {}}
-    for engine, engineopts in engines.items():
-        valuesinit = {paramname: [] for paramname in paramsinit}
-        for modelname in ["multidev", "exp"]:
-            fit = modelinfos[modelname]["fits"][engine][1]
-            paramsbest = dict(zip(fit["paramnames"], fit["paramsbest"]))
-            for paramname in paramsinit:
-                valuesinit[paramname].append(paramsbest[paramname])
-            if modelname == "exp":
-                offsetxy = (np.array([paramsbest["cenx"], paramsbest["ceny"]]) -
-                            np.flip(img.array.shape, axis=0)/2)
+                    inittype = inittype.split(';')
+                    if len(inittype) > 1:
+                        modelfits = [{
+                            'paramvals': fitsengine[initname]['fits'][-1]['paramsbestall'],
+                            'paramtree': models[fitsengine[initname]['modeltype']].getparameters(
+                                fixed=True, flatten=False),
+                            'params': models[fitsengine[initname]['modeltype']].getparameters(fixed=True),
+                            'chisqred': fitsengine[initname]['fits'][-1]['chisqred'],
+                            'modeltype': fitsengine[initname]['modeltype']}
+                            for initname in inittype
+                        ]
+                        initmodelfrommodelfits(model, modelfits)
+                        inittype = None
+                    else:
+                        inittype = inittype[0]
+                        if inittype not in fitsbyengine[engine]:
+                            # TODO: Fail or fall back here?
+                            raise RuntimeError("Model {} can't find reference {} to initialize from".format(
+                                modelname, inittype
+                            ))
+                if inittype:
+                    paramvalsinit = fitsbyengine[engine][inittype]["fits"][-1]["paramsbestall"]
+                    for param, value in zip(model.getparameters(fixed=True), paramvalsinit):
+                        param.setvalue(value, transformed=False)
+            # Reset parameter fixed status
+            for param, fixed in zip(model.getparameters(fixed=True), paramsfixeddefault[modeltype]):
+                param.fixed = fixed
+            # Parse default overrides from model spec
+            paramflags = {}
+            for flag in ["fixedparams", "initparams"]:
+                paramflags[flag] = {}
+                values = modelinfo[specs[flag]]
+                if values:
+                    for flagvalue in values.split(";"):
+                        if flag == "fixedparams":
+                            paramflags[flag][flagvalue] = None
+                        elif flag == "initparams":
+                            value = flagvalue.split("=")
+                            # TODO: sort this out
+                            valuesplit = [np.float(x) for x in value[1].split(',')]
+                            paramflags[flag][value[0]] = valuesplit
+            # For printing parameter values when plotting
+            modelnameappendparams = []
+            # Now actually apply the overrides
+            timesmatched = {}
+            for param in model.getparameters(fixed=True):
+                if param.name in paramflags["fixedparams"]:
+                    param.fixed = True
+                if param.name in paramflags["initparams"]:
+                    if param.name not in timesmatched:
+                        timesmatched[param.name] = 0
+                    param.setvalue(paramflags["initparams"][param.name][timesmatched[param.name]],
+                                   transformed=False)
+                    timesmatched[param.name] += 1
+                if plot and not param.fixed:
+                    if param.name == "nser":
+                        modelnameappendparams += [(",n={:.2f}", param)]
+                    elif isinstance(param, proobj.FluxParameter) and param.isfluxratio:
+                        modelnameappendparams += [(",f={:.2f}", param)]
 
-        # TODO: We're assuming a log10 transform here but should check it first
-        # ... or allow passing untransformed slopes, or grab the value from the old models?
-        modeltype = "multigaussiansersic:1,sersic:1"
-        model = proutil.getmodel({band: flux}, modeltype, npiximg,
-                                 valuesinit["re"], valuesinit["axrat"], valuesinit["ang"],
-                                 offsetxy=offsetxy, engine=engine, engineopts=engineopts,
-                                 istransformedvalues=True, slopes=[np.log10(4.), 0])
-        modelname = "cmodel"
-        # TODO: write function to do this since it's repeated
-        exposure = model.data.exposures[band][0]
-        exposure.image = img.array
-        if psfmodel is None:
-            exposure.psf = proobj.PSF(band=band, engine="galsim", image=psf)
+            print("Fitting model {:s} of type {:s} using engine {:s}".format(modelname, modeltype, engine))
+            sys.stdout.flush()
+            try:
+                fits = []
+                if usemodellibdefault:
+                    modellibopts = {"algo": "COBYLA"}
+                fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts, printfinal=True,
+                                          printsteps=100)
+                fits.append(fit1)
+                if usemodellibdefault:
+                    modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
+                fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
+                                   plot=plot, figure=figure, axes=axes, figurerow=modelidx,
+                                   modelname=modelname, modelnameappendparams=modelnameappendparams)
+                fits.append(fit2)
+                fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
+            except Exception as e:
+                print("Error fitting id={}:".format(idnum))
+                print(e)
+                trace = traceback.format_exc()
+                print(trace)
+                fitsbyengine[engine][modelname] = e, trace
+    if plot:
+        plt.show(block=False)
+        plt.tight_layout()
+        plt.subplots_adjust(wspace=0.05, hspace=0.05)
+
+    return fitsbyengine, models
+
+# Take a source (HST) image, convolve with a target (HSC) PSF, shift, rotate, and scale in amplitude until
+# they sort of match.
+# TODO: Would any attempt to incorporate the HST PSF improve things?
+# This obviously won't work well if imgsrc's PSF isn't much smaller than imgtarget's
+def imgoffsetchisq(x, args, returnimg=False):
+    img = gs.Convolve(
+        gs.InterpolatedImage(args['imgsrc']*10**x[0]).rotate(args['anglehst']),
+        args['psf']).shift(x[1], x[2]).drawImage(nx=args['nx'], ny=args['ny'], scale=args['scale'])
+    chisq = np.sum((img.array - args['imgtarget']) ** 2 / args['vartarget'])
+    if returnimg:
+        return img
+    return chisq
+
+
+# Fit the transform for a single COSMOS F814W image to match the HSC-I band image
+def fitcosmosgalaxytransform(ra, dec, imghst, imgpsfgs, sizeCutout, cutouthsc, varhsc, scalehsc, plot=False):
+    # Use Sophie's code to make our own cutout for comparison to the catalog
+    # TODO: Double check the origin of these images; I assume they're the rotated and rescaled v2.0 mosaics
+    cutouthst = make_cutout.cutout_HST(ra, dec, width=np.ceil(sizeCutout * scalehsc), return_data=True)
+    # 0.03" scale: check cutouthst[0][0][1].header["CD1_1"] and ["CD2_2"]
+    imghstrot = gs.Image(cutouthst[0][0][1].data, scale=0.03)
+
+    def getoffsetdiff(x, returnimg=False):
+        img = gs.InterpolatedImage(imghstrot).rotate(-x[0] * gs.radians).shift(
+            x[1], x[2]).drawImage(
+            nx=imghst.array.shape[1], ny=imghst.array.shape[0],
+            scale=imghst.scale)
+        if returnimg:
+            return img
+        return np.sum(np.abs(img.array - imghst.array))
+
+    result = spopt.minimize(getoffsetdiff, [-np.pi / 2, 0, 0], method="Nelder-Mead")
+    result2 = spopt.minimize(getoffsetdiff, result.x + [np.pi, 0, 0], method="Nelder-Mead")
+    [anglehst, xoffset, yoffset] = (result if result.fun < result2.fun else result2).x
+
+    if plot:
+        fig, ax = plt.subplots(nrows=2, ncols=2)
+        ax[0, 0].imshow(np.log10(imghstrot.array))
+        ax[0, 0].set_title("HST rotated")
+        ax[1, 0].imshow(np.log10(imghst.array))
+        ax[1, 0].set_title("COSMOS GalSim")
+        ax[0, 1].imshow(np.log10(getoffsetdiff([anglehst, xoffset, yoffset], returnimg=True).array))
+        ax[0, 1].set_title("HST re-rotated+shifted")
+
+    scalefluxhst2hsc = np.sum(cutouthsc)/np.sum(imghst.array)
+    args = {
+        "imgsrc": imghst,
+        "imgtarget": cutouthsc,
+        "vartarget": varhsc,
+        "psf": imgpsfgs,
+        "nx": sizeCutout,
+        "ny": sizeCutout,
+        "scale": scalehsc,
+        "anglehst": anglehst*gs.radians,
+    }
+    result = spopt.minimize(imgoffsetchisq, [np.log10(scalefluxhst2hsc), 0, 0], method="Nelder-Mead",
+                            args=args)
+
+    if plot:
+        ax[1, 1].imshow(np.log10(
+            gs.InterpolatedImage(imghst * 10 ** result.x[0]).rotate(anglehst * gs.radians).shift(
+                -xoffset, -yoffset).drawImage(nx=imghst.array.shape[1], ny=imghst.array.shape[0],
+                                              scale=imghst.scale).array))
+        ax[1, 1].set_title("COSMOS GalSim rotated+shifted")
+
+    return result, anglehst, xoffset, yoffset
+
+
+# PSFmodels: array of tuples (modelname, ispixelated)
+def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=True,
+                    modellib="scipy", modellibopts=None, hst2hscmodel=None,
+                    resetimages=False, resetfitlogs=False):
+    if results is None:
+        results = {}
+    np.random.seed(idcosmosgs)
+    radec = rgcfits[idcosmosgs][1:3]
+    imghst = rgcat.getGalImage(idcosmosgs)
+    scalehst = rgcfits[idcosmosgs]['PIXEL_SCALE']
+    bandhst = rgcat.band[idcosmosgs]
+    psfhst = rgcat.getPSF(idcosmosgs)
+    if "hsc" in srcs or "hst2hsc" in srcs:
+        # Get the HSC dataRef
+        spherePoint = geom.SpherePoint(radec[0], radec[1], geom.degrees)
+        patch = skymap[tract].findPatch(spherePoint).getIndex()
+        patch = ",".join([str(x) for x in patch])
+        dataId2 = {"tract": 9813, "patch": patch, "filter": "HSC-I"}
+        dataRef = butler.dataRef("deepCoadd", dataId=dataId2)
+        # Get the coadd
+        exposure = dataRef.get("deepCoadd_calexp")
+        scalehsc = exposure.getWcs().getPixelScale().asArcseconds()
+        # Get the measurements
+        measCat = dataRef.get("deepCoadd_meas")
+        # Get and verify match
+        distsq = ((radec[0] - np.degrees(measCat["coord_ra"])) ** 2 +
+                  (radec[1] - np.degrees(measCat["coord_dec"])) ** 2)
+        row = np.int(np.argmin(distsq))
+        idHsc = measCat["id"][row]
+        dist = np.sqrt(distsq[row]) * 3600
+        print('Source distance={:.2e}"'.format(dist))
+        # TODO: Threshold distance?
+        if dist > 1:
+            raise RuntimeError("Nearest HSC source at distance {:.3e}>1; aborting".format(dist))
+        # Determine the HSC cutout size (larger than HST due to bigger PSF)
+        sizeCutout = np.int(4 + np.ceil(np.max(imghst.array.shape) * scalehst / scalehsc))
+        sizeCutout += np.int(sizeCutout % 2)
+
+    # This does all of the necessary setup for each src. It should persist somehow
+    for src in srcs:
+        srcname = src
+        # TODO: None of this actually works in multiband, which it should for HSC one day
+        band = rgcat.band[idcosmosgs] if src == "hst" else "HSC-I"
+        metadata = {"band": band}
+        mask = None
+        if src == "hst":
+            img = imghst
+            psf = psfhst
+            sigmainverse = np.power(rgcat.getNoiseProperties(idcosmosgs)[2], -0.5)
         else:
-            exposure.psf = proobj.PSF(band=band, engine="galsim",
-                                      model=psfmodels[engine]["model"].sources[0])
-        exposure.sigmainverse = np.zeros(img.array.shape) + sigmainverse
-        for param in model.getparameters(fixed=False):
-            if param.name == "flux":
-                if param.isfluxratio:
-                    param.limits = copy.copy(param.limits)
-                    param.limits.lower = (param.transform.transform(fluxratmin) if
-                                          param.limits.transformed else fluxratmin)
-                    param.limits.upper = (param.transform.transform(fluxratmax) if
-                                          param.limits.transformed else fluxratmax)
-                    if not param.fixed:
-                        param.setvalue(0.2, transformed=False)
-            else:
-                param.fixed = True
-        # A clever way to append flux fractions for components since the plot should show the final B/T
-        appendparams = [(" f={:.2f}", param) for param in model.getparameters(fixed=False) if
-                        isinstance(param, proobj.FluxParameter) and param.isfluxratio]
-        # fit
-        fit, modeller = fitmodel(
-            model, modellib="pygmo", modellibopts={"algo": "neldermead"}, plot=plot, title=title,
-            modelname=modelname, figure=figure, axes=axes, figurerow=figurerow,
-            modelnameappendparams=appendparams
-        )
-        modelinfos[modelname]["fits"][engine] = [fit]
-        # fit again with all but nser free, and with a lower limit on the bulge axis ratio
-        modelname = "devexp"
-        axratmin = 0.5
-        # If fracdev < 0.5 and rebulge > redisk, reset the bulge size to half of the disk size
-        # Could also use nser instead
-        for param in model.getparameters(fixed=False):
-            if param.name == "flux" and param.isfluxratio:
-                if param.getvalue(transformed=False) < 0.5 and valuesinit["re"][0] > valuesinit["re"][1]:
-                    rebulge = valuesinit["re"][1]
+            psf = exposure.getPsf()
+            scalehscpsf = psf.getWcs(0).getPixelScale().asArcseconds()
+            imgpsf = psf.computeImage().array
+            imgpsfgs = gs.InterpolatedImage(gs.Image(imgpsf, scale=scalehscpsf))
+            useNoiseReplacer = True
+            if useNoiseReplacer:
+                noiseReplacer = rebuildNoiseReplacer(exposure, measCat)
+                noiseReplacer.insertSource(idHsc)
+            cutouthsc = make_cutout.make_cutout_lsst(
+                spherePoint, exposure, size=np.floor_divide(sizeCutout, 2))
+            idshsc = cutouthsc[4]
+            var = exposure.getMaskedImage().getVariance().array[
+                  idshsc[3]: idshsc[2], idshsc[1]: idshsc[0]]
+            if src == "hst2hsc":
+                # The COSMOS GalSim catalog is in the original HST frame, which is rotated by
+                # 10-12 degrees from RA/Dec axes; fit for this
+                result, anglehst, offsetxhst, offsetyhst = fitcosmosgalaxytransform(
+                    radec[0], radec[1], imghst, imgpsfgs, sizeCutout, cutouthsc[0], var, scalehsc, plot=plot
+                )
+                fluxscale = (10 ** result.x[0])
+                metadata["fluxscalehst2hsc"] = fluxscale
+                metadata["anglehst2hsc"] = anglehst
+                metadata["offsetxhst2hsc"] = offsetxhst
+                metadata["offsetyhst2hsc"] = offsetyhst
+
+                realgalaxy = ccat.makeGalaxy(index=idcosmosgs, gal_type="real")
+
+                # Assuming that these images match, add HSC noise back in
+                if hst2hscmodel is None:
+                    # TODO: Fix this as it's not working by default
+                    img = imgoffsetchisq(result.x, returnimg=True, imgsrc=imghst, imgref=cutouthsc[0],
+                                         psf=imgpsfgs, nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
                 else:
-                    rebulge = valuesinit["re"][0]
-        hassetbulge = {var: False for var in ["axrat", "re"]}
-        for param in model.getparameters(fixed=True):
-            if param.name in paramsinit + ["cenx", "ceny"]:
-                param.fixed = False
-            if param.name == "re":
-                param.limits = copy.deepcopy(param.limits)
-                remaxcomp = maxvalues["re"]
-                if not hassetbulge[param.name]:
-                    param.setvalue(rebulge, transformed=True)
-                    remaxcomp = param.getvalue(transformed=False)
-                    param.setvalue(remaxcomp/2, transformed=False)
-                    hassetbulge[param.name] = True
-                param.limits.upper = (param.transform.transform(remaxcomp) if
-                    param.limits.transformed else remaxcomp)
-            elif param.name == "axrat" and not hassetbulge[param.name]:
-                param.limits = copy.deepcopy(param.limits)
-                param.limits.lower = (param.transform.transform(axratmin) if
-                                      param.limits.transformed else axratmin)
-                if param.getvalue(transformed=False) < axratmin:
-                    param.setvalue(axratmin, transformed=False)
-                hassetbulge[param.name] = True
-        fit1, _ = fitmodel(model, modeller, printfinal=True, printsteps=100)
-        if hassetbulge["re"]:
-            # Run again without the limit on rebulge
-            for param, value in zip(model.getparameters(fixed=False), fit1["paramsbest"]):
-                if param.name == "re":
-                    param.limits.upper = (param.transform.transform(remaxcomp) if
-                        param.limits.transformed else remaxcomp)
-                param.setvalue(value, transformed=True)
-        # It won't hurt to restart the fit in both cases
-        if plot:
-            figurerow += 1
-        appendparams = [(" f={:.2f}", param) for param in model.getparameters(fixed=False) if
-                        isinstance(param, proobj.FluxParameter) and param.isfluxratio]
-        fit2, _ = fitmodel(
-            model, modeller,
-            plot=plot, title=title, modelname=modelname,
-            figure=figure, axes=axes, figurerow=figurerow, modelnameappendparams=appendparams
-        )
-        modelinfos[modelname]["fits"][engine] = [fit1, fit2]
-        if dofullbulgedisk:
-            # fit again with free bulge n
-            countnser = 0
-            for param in model.getparameters(fixed=True):
-                if param.name == "nser":
-                    if countnser == 0:
-                        param.fixed = False
-                    countnser += 1
-            fit = modeller.fit(printfinal=True)
-            modelinfos["serexp"]["fits"][engine] = fit
-            model.getlikelihood(params=fit["paramsbest"], plot=plot)
-            # fit one last time with everything free
-            countnser = 0
-            for param in model.getparameters(fixed=True):
-                if param.name == "nser":
-                    if countnser == 1:
-                        param.fixed = False
-                    countnser += 1
-            fit = modeller.fit(printfinal=True)
-            model.getlikelihood(params=fit["paramsbest"], plot=plot)
-            modelinfos["serser"]["fits"][engine] = [fit]
-        models[engine][modeltype] = dict(model=model, modeller=modeller)
-    return modelinfos, models, psfmodels
+                    fits = results['hst']['fits']['galsim']
+                    if hst2hscmodel == 'best':
+                        chisqredsmodel = {model: fit['fits'][-1]['chisqred'] for model, fit in fits.items()}
+                        modeltouse = min(chisqredsmodel, key=chisqredsmodel.get)
+                    else:
+                        modeltouse = hst2hscmodel
+                    modeltype = fits[modeltouse]['modeltype']
+                    srcname = "_".join([src, hst2hscmodel])
+                    # TODO: Store the name of the PyProFit model somewhere
+                    # In fact there wasn't really any need to store a model since we
+                    # can reconstruct it, but let's go ahead and use the unpickled one
+                    paramsbest = fits[modeltouse]['fits'][-1]['paramsbestalltransformed']
+                    # Apply all of the same rotations and shifts directly to the model
+                    modeltouse = results['hst']['models'][modeltype]
+                    metadata["hst2hscmodel"] = modeltouse
+                    scalefactor = scalehst / scalehsc
+                    imghstshape = imghst.array.shape
+                    # I'm pretty sure that these should all be converted to arcsec units
+                    for param, value in zip(modeltouse.getparameters(fixed=True), paramsbest):
+                        param.setvalue(value, transformed=True)
+                        valueset = param.getvalue(transformed=False)
+                        if param.name == "cenx":
+                            valueset = (scalehst * (valueset - imghstshape[1] / 2) + result.x[1]
+                                        + sizeCutout / 2)
+                        elif param.name == "ceny":
+                            valueset = (scalehst * (valueset - imghstshape[0] / 2) + result.x[2]
+                                        + sizeCutout / 2)
+                        elif param.name == "ang":
+                            valueset += np.degrees(anglehst)
+                        elif param.name == "re":
+                            valueset *= scalehst
+                        param.setvalue(valueset, transformed=False)
+                    exposuremodel = modeltouse.data.exposures[bandhst][0]
+                    exposuremodel.image = proutil.ImageEmpty((sizeCutout, sizeCutout))
+                    # Save the GalSim model object
+                    modeltouse.evaluate(keepmodels=True, getlikelihood=False, drawimage=False)
+                    img = gs.Convolve(exposuremodel.meta['model'], imgpsfgs).drawImage(
+                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc) * fluxscale
+
+                noisetoadd = np.random.normal(scale=np.sqrt(var))
+                img += noisetoadd
+
+                if plot:
+                    fig2, ax2 = plt.subplots(nrows=2, ncols=3)
+                    ax2[0, 0].imshow(np.log10(cutouthsc[0]))
+                    ax2[0, 0].set_title("HSC {}".format(band))
+                    imghst2hsc = gs.Convolve(
+                        realgalaxy.rotate(anglehst * gs.radians).shift(
+                            result.x[1], result.x[2]
+                        ), imgpsfgs).drawImage(
+                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
+                    imghst2hsc += noisetoadd
+                    imgs = (img.array, "my naive"), (imghst2hsc.array, "GS RealGal")
+                    descpre = "HST {} - {}"
+                    for imgidx, (imgit, desc) in enumerate(imgs):
+                        ax2[1, 1 + imgidx].imshow(np.log10(imgit))
+                        ax2[1, 1 + imgidx].set_title(descpre.format(bandhst, desc))
+                        ax2[0, 1 + imgidx].imshow(np.log10(imgit))
+                        ax2[0, 1 + imgidx].set_title((descpre + " + noise").format(
+                            bandhst, desc))
+
+                sigmainverse = 1.0 / np.sqrt(var)
+                # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image/model
+                psf = gs.Convolve(imgpsfgs, psfhst.rotate(anglehst * gs.degrees)).drawImage(
+                    nx=imgpsf.shape[1], ny=imgpsf.shape[0], scale=scalehscpsf
+                )
+                psf /= np.sum(psf.array)
+                psf = gs.InterpolatedImage(psf)
+            else:
+                # TODO: Fix this if desired
+                mask = exposure.getMaskedImage().getMask()
+                mask = mask.array[ids[3]: ids[2], ids[1]: ids[0]]
+                var = var.array[ids[3]: ids[2], ids[1]: ids[0]]
+                img = copy.deepcopy(exposure.maskedImage.image)
+                if not useNoiseReplacer:
+                    footprint = measCat[row].getFootprint()
+                    img *= 0
+                    footprint.getSpans().copyImage(exposure.maskedImage.image, img)
+                psf = imgpsfgs
+                mask = mask and img != 0
+                img = gs.Image(img[idshsc[3]: idshsc[2], idshsc[1]: idshsc[0]],
+                               scale=scalehsc)
+            sigmainverse = 1.0 / np.sqrt(var)
+
+        # Having worked out what the image, psf and variance map are, fit PSFs and images
+        if srcname not in results:
+            results[srcname] = {}
+        psfs = {}
+        specs = {name: idx for idx, name in enumerate(modelspecs[1])}
+        psfmodels = set([(x[specs["psfmodel"]], proutil.str2bool(x[specs["psfpixel"]])) for x in
+                          modelspecs[0]])
+        engineopts = {
+            "gsparams": gs.GSParams(kvalue_accuracy=1e-3, integration_relerr=1e-3, integration_abserr=1e-5)
+        }
+        fitname = "COSMOS #{}".format(idcosmosgs)
+        for psfmodelname, ispsfpixelated in psfmodels:
+            if psfmodelname == "empirical":
+                psfmodel = psf
+                psfexposure = proobj.PSF(band=band, engine="galsim", image=psf.image.array)
+            else:
+                engineopts["drawmethod"] = "no_pixel" if ispsfpixelated else None
+                psfmodel = fitpsf(psf.image.array, psfmodelname, {"galsim": engineopts}, band=band, plot=plot,
+                                  modelname=psfmodelname, title=fitname)["galsim"]
+                psfexposure = proobj.PSF(band=band, engine="galsim", model=psfmodel["model"].sources[0],
+                                         modelpixelated=ispsfpixelated)
+            psfname = psfmodelname + ("_pixelated" if ispsfpixelated else "")
+            psfs[psfname] = {"model": psfmodel, "object": psfexposure}
+        fits, models = fitgalaxy(
+            img=img, psfs=psfs, sigmainverse=sigmainverse, mask=mask, band=band, modelspecs=modelspecs,
+            name=fitname, modellib=modellib, plot=plot)
+        if resetimages:
+            for psfmodelname, psf in psfs.items():
+                if "model" in psf:
+                    proutil.setexposure(psf["model"]["model"], band, "empty")
+            for modelname, model in models.items():
+                proutil.setexposure(model, band, "empty")
+            for engine, modelfitinfo in fits.items():
+                for modelname, modelfits in modelfitinfo.items():
+                    if 'fits' in modelfits:
+                        for fit in modelfits["fits"]:
+                            fit["fitinfo"]["log"] = None
+                            # Don't try to pickle pygmo problems for some reason I forget
+                            if hasattr(fit["result"], "problem"):
+                                fit["result"]["problem"] = None
+            results[srcname] = {'fits': fits, 'models': models, 'psfs': psfs, 'metadata': metadata}
+
+    return results
 
 
 if __name__ == '__main__':
@@ -448,29 +648,20 @@ if __name__ == '__main__':
     }
 
     flags = {
-        'catalogpath': {'type': str, 'nargs': '?', 'default': None, 'help': 'File prefix to output results'},
-        'catalogfile': {'type': str, 'nargs': '?', 'default': None, 'help': 'File prefix to output results'},
+        'catalogpath': {'type': str, 'nargs': '?', 'default': None, 'help': 'GalSim catalog path'},
+        'catalogfile': {'type': str, 'nargs': '?', 'default': None, 'help': 'GalSim catalog filename'},
+        'fileout':     {'type': str, 'nargs': '?', 'default': None, 'help': 'File prefix to output results'},
         'fithst':      {'type': proutil.str2bool, 'default': False, 'help': 'Fit HSC I band image'},
         'fithsc':      {'type': proutil.str2bool, 'default': False, 'help': 'Fit HST F814W image'},
         'fithst2hsc':  {'type': proutil.str2bool, 'default': False, 'help': 'Fit HST F814W image convolved '
                                                                             'to HSC seeing'},
         'hst2hscmodel': {'type': str, 'default': None, 'help': 'HST model fit to use for mock HSC image'},
-        'psfmodel':    {'type': str,   'default': None, 'help': 'PSF model'},
-        'psfsizes':    {'type': int,   'nargs': '*', 'help': 'PSF image sizes (pixels)'},
-        'psffluxes':   {'type': float, 'nargs': '*', 'help': 'PSF fluxes [counts]'},
-        'psfradii':    {'type': float, 'nargs': '*', 'help': 'PSF D_50 (=FWHM for Gaussians only) [pixels]'},
-        'psfaxrats':   {'type': float, 'nargs': '*', 'help': 'PSF ellipticities [fraction]'},
-#        'imagesizes': {'type': int,   'nargs': '*', 'help': 'Galaxy image size (pixels)'},
-#        'galaxyfluxes':    {'type': float, 'nargs': '*', 'help': 'Galaxy fluxes [counts]'},
-#        'galaxyfluxmults': {'type': float, 'nargs': '+', 'help': 'Galaxy flux multipliers [counts]'},
-#        'galaxyradii':     {'type': float, 'nargs': '*', 'help': 'Galaxy sizes [pixels]'},
-        'modellib':    {'type': str,   'nargs': '?', 'default': 'pygmo', 'help': 'Optimization libraries'},
-        'algo':        {'type': str,   'nargs': '?', 'default': 'neldermead',
-                       'help': 'Optimization algorithms'},
+        'indices':     {'type': str, 'nargs': '*', 'default': None, 'help': 'Galaxy catalog index'},
+        'modelspecfile': {'type': str, 'default': None, 'help': 'Model specification file'},
+        'modellib':    {'type': str,   'nargs': '?', 'default': 'scipy', 'help': 'Optimization libraries'},
+        'modellibopts':{'type': str,   'nargs': '?', 'default': None, 'help': 'Model fitting options'},
 #        'engines':    {'type': str,   'nargs': '*', 'default': 'galsim', 'help': 'Model generation engines'},
         'plot':        {'type': proutil.str2bool, 'default': False, 'help': 'Toggle plotting of final fits'},
-        'fileout':    {'type': str,   'nargs': '?', 'default': None, 'help': 'File prefix to output results'},
-        'indices':     {'type': str, 'nargs': '*', 'default': None, 'help': 'Galaxy catalog index'},
 #        'seed':       {'type': int,   'nargs': '?', 'default': 1, 'help': 'Numpy random seed'}
     }
 
@@ -486,6 +677,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     args.catalogpath = os.path.expanduser(args.catalogpath)
+    modelspecs = getmodelspecs(None if args.modelspecfile is None else os.path.expanduser(args.modelspecfile))
 
     try:
         rgcat = gs.RealGalaxyCatalog(args.catalogfile, dir=args.catalogpath)
@@ -530,257 +722,24 @@ if __name__ == '__main__':
         srcs += ["hsc"]
     if args.fithst2hsc:
         srcs += ["hst2hsc"]
-    modeltypes = {
-        modelname:
-            "sersic:1,sersic:1" if modelname in ["serexp", "serser"] else
-            "multigaussiansersic:1,sersic:1" if modelname in ["cmodel", "devexp"] else
-            "multigaussian" if modelname in ["multiexp", "multidev"] else
-            "sersic" if modelname in ["gauss", "exp", "dev", "ser"] else None for modelname in
-        ["gauss", "exp", "dev", "ser"] + ["multiexp", "multidev"] +
-        ["cmodel", "devexp"] + ["serexp", "serser"]
-    }
 
     nfit = 0
     for index in args.indices:
         idrange = [np.int(x) for x in index.split(",")]
-        for id in range(idrange[0], idrange[0+(len(idrange)>1)] + (len(idrange)==1)):
-            print("Fitting COSMOS galaxy with ID: {}".format(id))
+        for idnum in range(idrange[0], idrange[0 + (len(idrange) > 1)] + (len(idrange) == 1)):
+            print("Fitting COSMOS galaxy with ID: {}".format(idnum))
             try:
-                np.random.seed(id)
-                src = None
-                radec = rgcfits[id][1:3]
-                imghst = rgcat.getGalImage(id)
-                fluxhst = rgcat.stamp_flux[id]
-                scalehst = rgcfits[id]['PIXEL_SCALE']
-                bandhst = rgcat.band[id]
-                psfhst = rgcat.getPSF(id)
-                if "hsc" in srcs or "hst2hsc" in srcs:
-                    # Get the HSC dataRef
-                    spherePoint = geom.SpherePoint(radec[0], radec[1], geom.degrees)
-                    patch = skymap[tract].findPatch(spherePoint).getIndex()
-                    patch = ",".join([str(x) for x in patch])
-                    dataId2 = {"tract": 9813, "patch": patch, "filter": "HSC-I"}
-                    dataRef = butler.dataRef("deepCoadd", dataId=dataId2)
-                    # Get the coadd
-                    exposure = dataRef.get("deepCoadd_calexp")
-                    scalehsc = exposure.getWcs().getPixelScale().asArcseconds()
-                    # Get the measurements
-                    measCat = dataRef.get("deepCoadd_meas")
-                    # Get and verify match
-                    distsq = ((radec[0] - np.degrees(measCat["coord_ra"])) ** 2 +
-                              (radec[1] - np.degrees(measCat["coord_dec"])) ** 2)
-                    row = np.int(np.argmin(distsq))
-                    idHsc = measCat["id"][row]
-                    dist = np.sqrt(distsq[row])*3600
-                    print('Source distance={:.2e}"'.format(dist))
-                    # TODO: Threshold distance?
-                    if dist > 1:
-                        raise RuntimeError("Nearest HSC source at distance {:.3e}>1; aborting".format(dist))
-                    # Determine the HSC cutout size (larger than HST due to bigger PSF)
-                    sizeCutout = np.int(4 + np.ceil(np.max(imghst.array.shape) * scalehst / scalehsc))
-                    sizeCutout += np.int(sizeCutout % 2)
-                for src in srcs:
-                    srcname = src
-                    bands = [rgcat.band[id] if src == "hst" else "HSC-I"]
-                    for band in bands:
-                        if src == "hst":
-                            img = imghst
-                            psf = psfhst
-                            sigmainverse = np.power(rgcat.getNoiseProperties(id)[2], -0.5)
-                        else:
-                            psf = exposure.getPsf()
-                            scalehscpsf = psf.getWcs(0).getPixelScale().asArcseconds()
-                            imgpsf = psf.computeImage().array
-                            imgpsfgs = gs.InterpolatedImage(gs.Image(imgpsf, scale=scalehscpsf))
-                            useNoiseReplacer = True
-                            if useNoiseReplacer:
-                                noiseReplacer = rebuildNoiseReplacer(exposure, measCat)
-                                noiseReplacer.insertSource(idHsc)
-                            cutouthsc = make_cutout.make_cutout_lsst(
-                                spherePoint, exposure, size=np.floor_divide(sizeCutout, 2))
-                            idshsc = cutouthsc[4]
-                            var = exposure.getMaskedImage().getVariance().array[
-                                  idshsc[3]: idshsc[2], idshsc[1]: idshsc[0]]
-                            if src == "hst2hsc":
-                                # The COSMOS GalSim catalog is in the original HST frame, which is rotated by
-                                # 10-12 degrees from RA/Dec axes; fit for this
-                                # Use Sophie's code to make our own cutout for comparison to the catalog
-                                cutouthst = make_cutout.cutout_HST(
-                                    radec[0], radec[1], width=np.ceil(sizeCutout * scalehsc),
-                                    return_data=True)
-                                imghstrot = gs.Image(cutouthst[0][0][1].data, scale=0.03)
-                                # 0.03" scale: check cutouthst[0][0][1].header["CD1_1"] and ["CD2_2"]
-
-                                def getoffsetdiff(x, returnimg=False):
-                                    img = gs.InterpolatedImage(imghstrot).rotate(-x[0] * gs.radians).shift(
-                                        x[1], x[2]).drawImage(
-                                        nx=imghst.array.shape[1], ny=imghst.array.shape[0],
-                                        scale=imghst.scale)
-                                    if returnimg:
-                                        return img
-                                    return np.sum(np.abs(img.array - imghst.array))
-
-                                result = spopt.minimize(getoffsetdiff, [-np.pi/2, 0, 0], method="Nelder-Mead")
-                                result2 = spopt.minimize(getoffsetdiff, result.x + [np.pi, 0, 0],
-                                                         method="Nelder-Mead")
-                                [anglehst, xoff, yoff] = (result if result.fun < result2.fun else result2).x
-
-                                if args.plot:
-                                    fig, ax = plt.subplots(nrows=2, ncols=2)
-                                    ax[0, 0].imshow(np.log10(imghstrot.array))
-                                    ax[0, 0].set_title("HST rotated")
-                                    ax[1, 0].imshow(np.log10(imghst.array))
-                                    ax[1, 0].set_title("COSMOS GalSim")
-                                    ax[0, 1].imshow(np.log10(getoffsetdiff([anglehst, xoff, yoff],
-                                                                        returnimg=True).array))
-                                    ax[0, 1].set_title("HST re-rotated+shifted")
-
-                                realGalaxy = ccat.makeGalaxy(index=id, gal_type="real")
-                                mask = None
-                                # My best attempt at matching is to shift and flux scale the HST2HSC image
-                                # until it's as close as possible to the HSC image
-                                def getoffsetchisq(x, returnimg=False):
-                                    img = gs.Convolve(
-                                        gs.InterpolatedImage(imghst*10**x[0]).rotate(anglehst * gs.radians),
-                                        imgpsfgs).shift(x[1], x[2]).drawImage(
-                                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
-                                    chisq = np.sum((img.array-cutouthsc[0])**2/var)
-                                    if returnimg:
-                                        return img
-                                    return chisq
-
-                                scalefluxhst2hsc = np.sum(cutouthsc[0]) / np.sum(imghst.array)
-                                result = spopt.minimize(getoffsetchisq,
-                                                        [np.log10(scalefluxhst2hsc), 0, 0],
-                                                        method="Nelder-Mead")
-                                fluxscale = (10**result.x[0])
-
-                                if args.plot:
-                                    ax[1, 1].imshow(np.log10(
-                                        gs.InterpolatedImage(imghst*10**result.x[0]).rotate(
-                                            anglehst * gs.radians).shift(-xoff, -yoff).drawImage(
-                                        nx=imghst.array.shape[1], ny=imghst.array.shape[0],
-                                        scale=imghst.scale).array))
-                                    ax[1, 1].set_title("COSMOS GalSim rotated+shifted")
-
-                                # Assuming that these images match, add HSC noise back in
-                                if args.hst2hscmodel is None:
-                                    img = getoffsetchisq(result.x, returnimg=True)
-                                else:
-                                    fits = data[id]['hst']['fits']
-                                    if args.hst2hscmodel == 'best':
-                                        chisqredsmodel = {
-                                            model: fit['fits']['galsim'][-1]['chisqred'] for model, fit in
-                                            fits.items() if 'galsim' in fit['fits']
-                                        }
-                                        modeltouse = min(chisqredsmodel, key=chisqredsmodel.get)
-                                    else:
-                                        modeltouse = args.hst2hscmodel
-                                    srcname = "_".join([src, args.hst2hscmodel])
-                                    # TODO: Store the name of the PyProFit model somewhere
-                                    # In fact there wasn't really any need to store a model since we
-                                    # can reconstruct it, but let's go ahead and use the unpickled one
-                                    paramsbest = fits[modeltouse]['fits']['galsim'][-1]['paramsbestall']
-                                    # Apply all of the same rotations and shifts directly to the model
-                                    modeltouse = data[id]['hst']['models']['galsim'][modeltypes[modeltouse]]
-                                    scalefactor = scalehst/scalehsc
-                                    imghstshape = imghst.array.shape
-                                    # I'm pretty sure that these should all be converted to arcsec units
-                                    for param, value in zip(modeltouse.getparameters(fixed=True), paramsbest):
-                                        param.setvalue(value, transformed=True)
-                                        valueset = param.getvalue(transformed=False)
-                                        if param.name == "cenx":
-                                            valueset = (scalehst*(valueset - imghstshape[1]/2) + result.x[1]
-                                                        + sizeCutout/2)
-                                        elif param.name == "ceny":
-                                            valueset = (scalehst*(valueset - imghstshape[0]/2) + result.x[2]
-                                                        + sizeCutout/2)
-                                        elif param.name == "ang":
-                                            valueset += np.degrees(anglehst)
-                                        elif param.name == "re":
-                                            valueset *= scalehst
-                                        param.setvalue(valueset, transformed=False)
-                                    exposuremodel = modeltouse.data.exposures[bandhst][0]
-                                    exposuremodel.image = proutil.ImageEmpty((sizeCutout, sizeCutout))
-                                    # Save the GalSim model object
-                                    modeltouse.evaluate(keepmodels=True, getlikelihood=False, drawimage=False)
-                                    img = gs.Convolve(exposuremodel.meta['model'], imgpsfgs).drawImage(
-                                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc)*fluxscale
-
-                                noisetoadd = np.random.normal(scale=np.sqrt(var))
-                                img += noisetoadd
-
-                                if args.plot:
-                                    fig2, ax2 = plt.subplots(nrows=2, ncols=3)
-                                    ax2[0, 0].imshow(np.log10(cutouthsc[0]))
-                                    ax2[0, 0].set_title("HSC {}".format(band))
-                                    imghst2hsc = gs.Convolve(
-                                        realGalaxy.rotate(anglehst * gs.radians).shift(
-                                            result.x[1], result.x[2]
-                                        ), imgpsfgs).drawImage(
-                                        nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
-                                    imghst2hsc += noisetoadd
-                                    imgs = (img.array, "my naive"), (imghst2hsc.array, "GS RealGal")
-                                    descpre = "HST {} - {}"
-                                    for imgidx, (imgit, desc) in enumerate(imgs):
-                                        ax2[1, 1+imgidx].imshow(np.log10(imgit))
-                                        ax2[1, 1+imgidx].set_title(descpre.format(bandhst, desc))
-                                        ax2[0, 1 + imgidx].imshow(np.log10(imgit))
-                                        ax2[0, 1 + imgidx].set_title((descpre + " + noise").format(
-                                            bandhst, desc))
-
-                                sigmainverse = 1.0/np.sqrt(var)
-                                # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image/model
-                                psf = gs.InterpolatedImage(gs.Convolve(
-                                    imgpsfgs, psfhst.rotate(anglehst*gs.degrees)).drawImage(
-                                    nx=imgpsf.shape[1], ny=imgpsf.shape[0], scale=scalehscpsf)
-                                )
-                                psf.image /= np.sum(psf.image.array)
-                            else:
-                                mask = exposure.getMaskedImage().getMask()
-                                mask = mask.array[ids[3]: ids[2], ids[1]: ids[0]]
-                                var = var.array[ids[3]: ids[2], ids[1]: ids[0]]
-                                img = copy.deepcopy(exposure.maskedImage.image)
-                                if not useNoiseReplacer:
-                                    footprint = measCat[row].getFootprint()
-                                    img *= 0
-                                    footprint.getSpans().copyImage(exposure.maskedImage.image, img)
-                                psf = imgpsfgs
-                                mask = img != 0
-                                img = gs.Image(img[idshsc[3]: idshsc[2], idshsc[1]: idshsc[0]],
-                                               scale=scalehsc)
-                            sigmainverse = 1.0 / np.sqrt(var)
-
-                    fits, models, psfmodels = fitgalaxy(
-                        img=img, psf=psf, sigmainverse=sigmainverse, band=band, name="COSMOS #{}".format(id),
-                        modellib=args.modellib, algo=args.algo, psfmodel=args.psfmodel, plot=args.plot)
-                    for band in bands:
-                        # Set all exposures to have no images - we can rebuild them if needed
-                        for engine, modelinfos in models.items():
-                            for modelname, modelinfo in modelinfos.items():
-                                models[engine][modelname] = setexposure(modelinfo["model"], band)
-                        for engine, modelinfo in psfmodels.items():
-                            setexposure(modelinfo["model"], band)
-                        # TODO: This might be a little too convoluted. Deconvolve.
-                    for modelname, modelfitinfo in fits.items():
-                        for engine, modelfits in modelfitinfo["fits"].items():
-                            for fit in modelfits:
-                                fit["fitinfo"]["log"] = None
-                                if hasattr(fit["result"], "problem"):
-                                    fit["result"] = None
-                    if id not in data:
-                        data[id] = {}
-                    data[id][srcname] = {"models": models, "fits": fits, "psfmodels": psfmodels}
+                fits = fitcosmosgalaxy(idnum, srcs=srcs, modelspecs=modelspecs, plot=args.plot, redo=True,
+                                       resetimages=True, resetfitlogs=True, hst2hscmodel=args.hst2hscmodel,
+                                       results=data[idnum] if idnum in data else None)
+                data[idnum] = fits
             except Exception as e:
-                print("Error fitting id={}:".format(id))
+                print("Error fitting id={}:".format(idnum))
                 print(e)
                 trace = traceback.format_exc()
                 print(trace)
-                if src is not None:
-                    if id not in data:
-                        data[id] = {}
-                    data[id][srcname] = e, trace
-
+                if idnum not in data:
+                    data[idnum] = e, trace
             nfit += 1
             if args.fileout is not None and (nfit % 10) == 0:
                 with open(os.path.expanduser(args.fileout), 'wb') as f:
@@ -790,4 +749,5 @@ if __name__ == '__main__':
         with open(os.path.expanduser(args.fileout), 'wb') as f:
             pickle.dump(data, f)
     if args.plot:
+        plt.show(block=False)
         input("Press Enter to finish")

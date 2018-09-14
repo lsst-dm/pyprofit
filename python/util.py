@@ -1,9 +1,20 @@
+
 import argparse
 import functools
+import matplotlib.pyplot as plt
 import numpy as np
-from scipy import stats
+from scipy import special, stats
 
 import pyprofit.python.objects as proobj
+
+
+def logitlimited(x, lower, extent):
+    return special.logit((x-lower)/extent)
+
+
+def expitlimited(x, lower, extent):
+    return special.expit(x)*extent + lower
+
 
 transformsref = {
     "none": proobj.Transform(),
@@ -11,6 +22,9 @@ transformsref = {
     "log10": proobj.Transform(transform=np.log10, reverse=functools.partial(np.power, 10.)),
     "inverse": proobj.Transform(transform=functools.partial(np.divide, 1.),
                                 reverse=functools.partial(np.divide, 1.)),
+    "logit": proobj.Transform(transform=special.logit, reverse=special.expit),
+    "logitsersic": proobj.Transform(transform=functools.partial(logitlimited, lower=0.3, extent=5.7),
+                                    reverse=functools.partial(expitlimited, lower=0.3, extent=5.7))
 }
 
 
@@ -72,7 +86,7 @@ def truncnormlogpdfmean(x, mean=0., scale=1., a=-np.inf, b=np.inf):
     return stats.truncnorm.logpdf(x - mean, scale=scale, a=a, b=b)
 
 
-def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransformed=False):
+def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransformed=False, sersiclogit=True):
     transform = transformsref["none"]
     limits = limitsref["none"]
     name = param
@@ -85,19 +99,21 @@ def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransfo
                 value = 2.5
         elif profile == "sersic":
             name = "nser"
-            transform = transformsref["log10"]
-            limits = limitsref["nserlog10"]
+            if sersiclogit:
+                transform = transformsref["logitsersic"]
+            else:
+                transform = transformsref["log10"]
+                limits = limitsref["nserlog10"]
             if value is None:
                 value = 0.5
-    elif param == "size" or param == "axrat":
+    elif param == "size":
         transform = transformsref["log10"]
-        if param == "axrat":
-            limits = limitsref["axratlog10"]
-        elif param == "size":
-            if profile == "moffat":
-                name = "fwhm"
-            elif profile == "sersic":
-                name = "re"
+        if profile == "moffat":
+            name = "fwhm"
+        elif profile == "sersic":
+            name = "re"
+    elif param == "axrat":
+        transform = transformsref["logit"]
 
     if value is None:
         # TODO: Improve this (at least check limits)
@@ -111,23 +127,11 @@ def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransfo
 
 
 def getmodel(
-    fluxesbyband, modelstr, imagesize, sizes, axrats, angs, slopes=None, fluxfracs=None,
+    fluxesbyband, modelstr, imagesize, sizes=None, axrats=None, angs=None, slopes=None, fluxfracs=None,
     offsetxy=None, name="", nexposures=1, engine="galsim", engineopts=None, istransformedvalues=False
 ):
     bands = fluxesbyband.keys()
     modelstrs = modelstr.split(",")
-
-    try:
-        sizes = np.array(sizes)
-        axrats = np.array(axrats)
-        angs = np.array(angs)
-        if slopes is not None:
-            slopes = np.array(slopes)
-        if fluxfracs is not None:
-            fluxfracs = np.array(fluxfracs)
-        # TODO: Verify lengths identical to bandscount
-    except Exception as error:
-        raise error
 
     profiles = {}
     ncomps = 0
@@ -137,8 +141,17 @@ def getmodel(
         profiles[profile] = ncompsprof
         ncomps += ncompsprof
 
-    if slopes is None:
-        slopes = np.repeat(None, ncomps)
+    try:
+        noneall = np.repeat(None, ncomps)
+        sizes = np.array(sizes) if sizes is not None else noneall
+        axrats = np.array(axrats) if axrats is not None else noneall
+        angs = np.array(angs) if angs is not None else noneall
+        slopes = np.array(slopes) if slopes is not None else noneall
+        if fluxfracs is not None:
+            fluxfracs = np.array(fluxfracs)
+        # TODO: Verify lengths identical to bandscount
+    except Exception as error:
+        raise error
 
     cenx, ceny = [x / 2.0 for x in imagesize]
     if offsetxy is not None:
@@ -190,8 +203,8 @@ def getmodel(
             islast = compi == (ncomps - 1)
             paramfluxescomp = [
                 proobj.FluxParameter(
-                    band, "flux", np.log10(fluxfracs[compi]), "", limits=limitsref["fractionlog10"],
-                    transform=transformsref["log10"], fixed=islast, isfluxratio=True)
+                    band, "flux", special.logit(fluxfracs[compi]), "", limits=limitsref["none"],
+                    transform=transformsref["logit"], fixed=islast, isfluxratio=True)
                 for band in bands
             ]
             params = [getparamdefault(param, valueslice[compi], profile,
@@ -216,4 +229,57 @@ def getmodel(
     modelphoto = proobj.PhotometricModel(components, paramfluxes)
     source = proobj.Source(modelastro, modelphoto, name)
     model = proobj.Model([source], data, engine=engine, engineopts=engineopts)
+    return model
+
+
+def getchisqred(chis):
+    chisum = 0
+    chicount = 0
+    for chivals in chis:
+        chisum += np.sum(chivals**2)
+        chicount += len(chivals)**2
+    return chisum/chicount
+
+
+def fitmodel(model, modeller=None, modellib="scipy", modellibopts={'algo': "Nelder-Mead"}, printfinal=True,
+             printsteps=100, plot=False, modelname=None, figure=None, title=None, axes=None,
+             figurerow=None, modelnameappendparams=None, **kwargs):
+    if modeller is None:
+        modeller = proobj.Modeller(model=model, modellib=modellib, modellibopts=modellibopts, **kwargs)
+    fit = modeller.fit(printfinal=printfinal, printsteps=printsteps)
+    # Conveniently sets the parameters to the right values too
+    if plot:
+        modeldesc = modelname
+        if modelnameappendparams is not None:
+            for string, param in modelnameappendparams:
+                modeldesc += string.format(param.getvalue(transformed=False))
+    else:
+        modeldesc = None
+    _, _, chis, _ = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modeldesc, figure=figure,
+                                   axes=axes, figurerow=figurerow)
+    if plot:
+        if title is not None:
+            plt.suptitle(title)
+        plt.show(block=False)
+    fit["chisqred"] = getchisqred(chis)
+    params = model.getparameters()
+    fit["paramsbestall"] = [param.getvalue(transformed=False) for param in params]
+    fit["paramsbestalltransformed"] = [param.getvalue(transformed=True) for param in params]
+    return fit, modeller
+
+
+def setexposure(model, band, image=None, sigmainverse=None, psf=None, mask=None, factorsigma=1):
+    exposure = model.data.exposures[band][0]
+    imageisempty = image is "empty"
+    exposure.image = image if not imageisempty else ImageEmpty(exposure.image.shape)
+    if imageisempty:
+        exposure.sigmainverse = exposure.image
+    else:
+        if psf is None and image is not None and sigmainverse is None:
+            sigmaimg = np.sqrt(np.var(image))
+            exposure.sigmainverse = 1.0/(factorsigma*sigmaimg)
+        else:
+            exposure.sigmainverse = sigmainverse
+    exposure.psf = psf
+    exposure.mask = mask
     return model
