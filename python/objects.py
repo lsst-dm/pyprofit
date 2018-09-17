@@ -646,15 +646,22 @@ class Model:
                         if drawimage:
                             imagegs = profilesgs.drawImage(method=method, nx=nx, ny=ny, scale=scale)
                         model = profilesgs
+                # This is not a great hack - catch RunTimeErrors which are usually excessively large FFTs
+                # and then try to evaluate the model in real space or give up if it's anything else
                 except RuntimeError as e:
-                    if method == "fft":
-                        if haspsfimage:
-                            imagegs = profilesgs[True].drawImage(method="real_space",
-                                                                 nx=nx, ny=ny, scale=scale) + \
-                                      profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                    try:
+                        if method == "fft":
+                            if haspsfimage:
+                                imagegs = profilesgs[True].drawImage(method="real_space",
+                                                                     nx=nx, ny=ny, scale=scale) + \
+                                          profilesgs[False].drawImage(method=method, nx=nx, ny=ny, scale=scale)
+                                model = profilesgs[True] + profilesgs[False]
+                            else:
+                                imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=scale)
+                                model = profilesgs
                         else:
-                            imagegs = profilesgs.drawImage(method="real_space", nx=nx, ny=ny, scale=scale)
-                    else:
+                            raise e
+                    except Exception as e:
                         raise e
                 except Exception as e:
                     raise e
@@ -859,9 +866,9 @@ class Modeller:
                 return -modeller.evaluate(params, timing=timing, returnlponly=True)
 
             tinit = time.time()
-            result = spopt.minimize(neg_like_model, paramsinit, method=algo,
-                                    bounds=np.array(limits),
-                                    options={'disp': True}, args=(self, ))
+            result = spopt.minimize(neg_like_model, paramsinit, method=algo, bounds=np.array(limits),
+                                    options={} if 'options' not in self.modellibopts else
+                                    self.modellibopts['options'], args=(self, ))
             timerun += time.time() - tinit
             paramsbest = result.x
 
