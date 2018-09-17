@@ -4,7 +4,6 @@ import pyprofit.python.profit as pro
 import pyprofit.python.objects as proobj
 
 import argparse
-import fitsio
 import functools
 import galsim as gs
 import itertools
@@ -12,7 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import select
-from skimage import measure
 import subprocess
 from subprocess import PIPE
 from scipy import stats
@@ -197,7 +195,8 @@ def downloadhsc(outfile, ra, dec, semiwidth=None, semiheight=None, getpsf=None, 
 
 
 def gethsc(bands, ra, dec, prefix=None, **kwargs):
-
+    import fitsio
+    from skimage import measure
     bandshsc = ["HSC-" + band for band in ["G", "R", "I", "Z", "Y"]] + ["NB" + ang for ang in ["0816", "0921"]]
     extensions = {
         "image": "IMAGE",
