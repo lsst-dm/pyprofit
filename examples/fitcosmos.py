@@ -206,7 +206,7 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
     npiximg = np.flip(img.array.shape, axis=0)
     flux = np.sum(img.array[mask] if mask is not None else img.array)
 
-    maxvalues = {
+    valuesmax = {
         "re": np.sqrt(np.sum((npiximg/2.)**2)),
         "flux": 10*np.sum(img.array),
     }
@@ -235,16 +235,14 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
             if modeltype not in models:
                 models[modeltype] = proutil.getmodel(
                     {band: flux}, modeltype, npiximg, engine=engine, engineopts=engineopts
-                    # offsetxy=offsetxy, ,
-                    # istransformedvalues=istransformedvalues, slopes=[np.log10(4.), 0]
                 )
                 paramsfixeddefault[modeltype] = [param.fixed for param in
                                                  models[modeltype].getparameters(fixed=True)]
             model = models[modeltype]
             psfname = modelinfo[specs["psfmodel"]] + ("_pixelated" if proutil.str2bool(
                 modelinfo[specs["psfpixel"]]) else "")
-            proutil.setexposure(model, band, image=img.array, sigmainverse=sigmainverse, psf=psfs[psfname]["object"],
-                        mask=mask)
+            proutil.setexposure(model, band, image=img.array, sigmainverse=sigmainverse,
+                                psf=psfs[psfname]["object"], mask=mask)
             inittype = modelinfo[specs["inittype"]]
             if inittype == "moments":
                 for param in model.getparameters(fixed=False):
@@ -313,7 +311,7 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
                             paramflags[flag][value[0]] = valuesplit
             # For printing parameter values when plotting
             modelnameappendparams = []
-            # Now actually apply the overrides
+            # Now actually apply the overrides and the hardcoded maxima
             timesmatched = {}
             for param in model.getparameters(fixed=True):
                 if param.name in paramflags["fixedparams"]:
@@ -324,11 +322,16 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
                     param.setvalue(paramflags["initparams"][param.name][timesmatched[param.name]],
                                    transformed=False)
                     timesmatched[param.name] += 1
+                isfluxrat = isinstance(param, proobj.FluxParameter) and param.isfluxratio
                 if plot and not param.fixed:
                     if param.name == "nser":
                         modelnameappendparams += [(",n={:.2f}", param)]
-                    elif isinstance(param, proobj.FluxParameter) and param.isfluxratio:
+                    elif isfluxrat:
                         modelnameappendparams += [(",f={:.2f}", param)]
+                if param.name in valuesmax and not isfluxrat:
+                    transform = param.transform.transform
+                    param.limits = proobj.Limits(lower=transform(0), upper=transform(valuesmax[param.name]),
+                                                 transformed=True)
 
             print("Fitting model {:s} of type {:s} using engine {:s}".format(modelname, modeltype, engine))
             sys.stdout.flush()
@@ -336,14 +339,16 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
                 fits = []
                 if usemodellibdefault:
                     modellibopts = {"algo": "COBYLA"}
+                    if modellib == "scipy":
+                        modellibopts['options'] = {'maxfun': 1e4}
                 fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts, printfinal=True,
-                                          printsteps=100)
+                                          printsteps=100, maxiter=1e4)
                 fits.append(fit1)
                 if usemodellibdefault:
                     modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
                 fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
-                                   plot=plot, figure=figure, axes=axes, figurerow=modelidx,
-                                   modelname=modelname, modelnameappendparams=modelnameappendparams)
+                                           plot=plot, figure=figure, axes=axes, figurerow=modelidx,
+                                           modelname=modelname, modelnameappendparams=modelnameappendparams)
                 fits.append(fit2)
                 fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
             except Exception as e:
