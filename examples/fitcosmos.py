@@ -337,19 +337,26 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
             sys.stdout.flush()
             try:
                 fits = []
+                dosecond = not usemodellibdefault
                 if usemodellibdefault:
-                    modellibopts = {"algo": "COBYLA"}
+                    modellibopts = {"algo": "Nelder-Mead"}
                     if modellib == "scipy":
                         modellibopts['options'] = {'maxfun': 1e4}
-                fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts, printfinal=True,
-                                          printsteps=100, maxiter=1e4)
+                fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts,
+                                                  printfinal=True, printsteps=100, plot=plot and not dosecond,
+                                                  figure=figure, axes=axes, figurerow=modelidx,
+                                                  modelname=modelname,
+                                                  modelnameappendparams=modelnameappendparams
+                                                  )
                 fits.append(fit1)
-                if usemodellibdefault:
-                    modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
-                fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
-                                           plot=plot, figure=figure, axes=axes, figurerow=modelidx,
-                                           modelname=modelname, modelnameappendparams=modelnameappendparams)
-                fits.append(fit2)
+                if dosecond:
+                    if usemodellibdefault:
+                        modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
+                    fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
+                                               plot=plot, figure=figure, axes=axes, figurerow=modelidx,
+                                               modelname=modelname,
+                                               modelnameappendparams=modelnameappendparams)
+                    fits.append(fit2)
                 fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
             except Exception as e:
                 print("Error fitting id={}:".format(idnum))
@@ -361,6 +368,7 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
         plt.show(block=False)
         plt.tight_layout()
         plt.subplots_adjust(wspace=0.05, hspace=0.05)
+        plt.show(block=False)
 
     return fitsbyengine, models
 
