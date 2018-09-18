@@ -24,7 +24,10 @@ transformsref = {
                                 reverse=functools.partial(np.divide, 1.)),
     "logit": proobj.Transform(transform=special.logit, reverse=special.expit),
     "logitsersic": proobj.Transform(transform=functools.partial(logitlimited, lower=0.3, extent=5.7),
-                                    reverse=functools.partial(expitlimited, lower=0.3, extent=5.7))
+                                    reverse=functools.partial(expitlimited, lower=0.3, extent=5.7)),
+    "logitmultigausssersic": proobj.Transform(
+        transform=functools.partial(logitlimited, lower=0.499, extent=5.501),
+        reverse=functools.partial(expitlimited, lower=0.499, extent=5.501)),
 }
 
 
@@ -86,7 +89,8 @@ def truncnormlogpdfmean(x, mean=0., scale=1., a=-np.inf, b=np.inf):
     return stats.truncnorm.logpdf(x - mean, scale=scale, a=a, b=b)
 
 
-def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransformed=False, sersiclogit=True):
+def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransformed=False,
+                    sersiclogit=True, ismultigauss=False):
     transform = transformsref["none"]
     limits = limitsref["none"]
     name = param
@@ -100,7 +104,10 @@ def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransfo
         elif profile == "sersic":
             name = "nser"
             if sersiclogit:
-                transform = transformsref["logitsersic"]
+                if ismultigauss:
+                    transform = transformsref["logitmultigausssersic"]
+                else:
+                    transform = transformsref["logitsersic"]
             else:
                 transform = transformsref["log10"]
                 limits = limitsref["nserlog10"]
@@ -203,13 +210,14 @@ def getmodel(
             islast = compi == (ncomps - 1)
             paramfluxescomp = [
                 proobj.FluxParameter(
-                    band, "flux", special.logit(fluxfracs[compi]), "", limits=limitsref["none"],
+                    band, "flux", special.logit(fluxfracs[compi]), None, limits=limitsref["none"],
                     transform=transformsref["logit"], fixed=islast, isfluxratio=True)
                 for band in bands
             ]
             params = [getparamdefault(param, valueslice[compi], profile,
-                                      fixed=param == "slope" and (isgaussian or ismultigaussiansersic),
-                                      isvaluetransformed=istransformedvalues)
+                                      fixed=param == "slope" and isgaussian,
+                                      isvaluetransformed=istransformedvalues,
+                                      ismultigauss=ismultigaussiansersic)
                       for param, valueslice in values.items()]
             if ismultigaussiansersic or issoftened:
                 components.append(proobj.MultiGaussianApproximationProfile(
@@ -221,7 +229,7 @@ def getmodel(
         compnum += nprofiles
 
     paramfluxes = [proobj.FluxParameter(
-            band, "flux", np.log10(fluxesbyband[band]), "", limits=limitsref["none"],
+            band, "flux", np.log10(fluxesbyband[band]), None, limits=limitsref["none"],
             transform=transformsref["log10"], transformed=True, prior=None, fixed=False,
             isfluxratio=False)
         for bandi, band in enumerate(bands)
@@ -243,9 +251,9 @@ def getchisqred(chis):
 
 def fitmodel(model, modeller=None, modellib="scipy", modellibopts={'algo': "Nelder-Mead"}, printfinal=True,
              printsteps=100, plot=False, modelname=None, figure=None, title=None, axes=None,
-             figurerow=None, modelnameappendparams=None, **kwargs):
+             figurerow=None, modelnameappendparams=None):
     if modeller is None:
-        modeller = proobj.Modeller(model=model, modellib=modellib, modellibopts=modellibopts, **kwargs)
+        modeller = proobj.Modeller(model=model, modellib=modellib, modellibopts=modellibopts)
     fit = modeller.fit(printfinal=printfinal, printsteps=printsteps)
     # Conveniently sets the parameters to the right values too
     if plot:
