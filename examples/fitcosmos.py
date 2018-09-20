@@ -221,14 +221,19 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
         fitsengine = fitsbyengine[engine]
         if plot:
             nrows = len(modelspecs[0])
-            figure, axes = plt.subplots(nrows=nrows, ncols=5)
+            # Change to landscape
+            figure, axes = plt.subplots(nrows=min([5, nrows]), ncols=max([5, nrows]))
+            if nrows > 5:
+                axes = np.transpose(axes)
             # This keeps things consistent with the nrows>1 case
             if nrows == 1:
                 axes = np.array([axes])
             plt.suptitle(title + " {} model".format(engine))
+            flipplot = nrows > 5
         else:
             figure = None
             axes = None
+            flipplot = None
         for modelidx, modelinfo in enumerate(modelspecs[0]):
             modelname = modelinfo[specs["name"]]
             modeltype = modelinfo[specs["model"]]
@@ -337,15 +342,18 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
             sys.stdout.flush()
             try:
                 fits = []
-                dosecond = not usemodellibdefault
+                dosecond = (len(model.sources[0].modelphotometric.components) > 1) or not usemodellibdefault
                 if usemodellibdefault:
-                    modellibopts = {"algo": "Nelder-Mead"}
+                    modellibopts = {
+                        "algo": ("cobyla" if modellib == "pygmo" else "COBYLA") if dosecond else
+                        ("neldermead" if modellib == "pygmo" else "Nelder-Mead")
+                    }
                     if modellib == "scipy":
                         modellibopts['options'] = {'maxfun': 1e4}
                 fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts,
                                                   printfinal=True, printsteps=100, plot=plot and not dosecond,
                                                   figure=figure, axes=axes, figurerow=modelidx,
-                                                  modelname=modelname,
+                                                  flipplot=flipplot, modelname=modelname,
                                                   modelnameappendparams=modelnameappendparams
                                                   )
                 fits.append(fit1)
@@ -354,7 +362,7 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
                         modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
                     fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
                                                plot=plot, figure=figure, axes=axes, figurerow=modelidx,
-                                               modelname=modelname,
+                                               flipplot=flipplot, modelname=modelname,
                                                modelnameappendparams=modelnameappendparams)
                     fits.append(fit2)
                 fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
@@ -429,6 +437,7 @@ def fitcosmosgalaxytransform(ra, dec, imghst, imgpsfgs, sizeCutout, cutouthsc, v
     }
     result = spopt.minimize(imgoffsetchisq, [np.log10(scalefluxhst2hsc), 0, 0], method="Nelder-Mead",
                             args=args)
+    print("Offsetchisq fit params:", result.x)
 
     if plot:
         ax[1, 1].imshow(np.log10(
@@ -520,7 +529,7 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                 # Assuming that these images match, add HSC noise back in
                 if hst2hscmodel is None:
                     # TODO: Fix this as it's not working by default
-                    img = imgoffsetchisq(result.x, returnimg=True, imgsrc=imghst, imgref=cutouthsc[0],
+                    img = imgoffsetchisq(result.x, returnimg=True, imgref=cutouthsc[0],
                                          psf=imgpsfgs, nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
                 else:
                     fits = results['hst']['fits']['galsim']
@@ -744,7 +753,7 @@ if __name__ == '__main__':
             try:
                 fits = fitcosmosgalaxy(idnum, srcs=srcs, modelspecs=modelspecs, plot=args.plot, redo=True,
                                        resetimages=True, resetfitlogs=True, hst2hscmodel=args.hst2hscmodel,
-                                       results=data[idnum] if idnum in data else None)
+                                       results=data[idnum] if idnum in data else None, modellib=args.modellib)
                 data[idnum] = fits
             except Exception as e:
                 print("Error fitting id={}:".format(idnum))
