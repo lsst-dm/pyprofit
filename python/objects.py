@@ -207,7 +207,7 @@ class Model:
     def evaluate(self, params=None, data=None, bands=None, engine=None, engineopts=None,
                  paramstransformed=True, getlikelihood=True, likelihoodlog=True, keeplikelihood=False,
                  keepimages=False, keepmodels=False, plot=False, figure=None, axes=None, figurerow=None,
-                 modelname="Model", drawimage=True, scale=1, clock=False):
+                 modelname="Model", modeldesc=None, drawimage=True, scale=1, clock=False, flipplot=False):
         """
             Get the likelihood and/or model images
         """
@@ -280,8 +280,9 @@ class Model:
                     likelihoodexposure, chi, chiimg, chiclip, imgclip, modelclip = \
                         self.getexposurelikelihood(
                             exposure, image, log=likelihoodlog, figaxes=figaxes, modelname=modelname,
-                            istoprow=figurerow is None or figurerow == 0,
-                            isbottomrow=figurerow is None or axes is None or (figurerow+1) == axes.shape[0]
+                            modeldesc=modeldesc, istoprow=figurerow is None or figurerow == 0,
+                            isbottomrow=figurerow is None or axes is None or (figurerow+1) == axes.shape[0],
+                            flipplot=flipplot
                         )
                     if keeplikelihood:
                         exposure.meta["likelihood"] = likelihoodexposure
@@ -348,8 +349,8 @@ class Model:
             axes[i].set_yticklabels([])
 
     def getexposurelikelihood(self, exposure, modelimage, log=True, likefunc=None,
-                              figaxes=None, maximg=None, minimg=None, modelname="Model", istoprow=True,
-                              isbottomrow=True):
+                              figaxes=None, maximg=None, minimg=None, modelname="Model",
+                              modeldesc=None, istoprow=True, isbottomrow=True, flipplot=False):
         if likefunc is None:
             likefunc = self.likefunc
         hasmask = exposure.maskinverse is not None
@@ -376,10 +377,12 @@ class Model:
                 if hasmask:
                     z = exposure.maskinverse
                     axes[i].contour(x, y, z)
-            axes[0].set_ylabel('Band={}'.format(exposure.band))
+            (axes[0].set_title if flipplot else axes[0].set_ylabel)('Band={}'.format(exposure.band))
             # Check if the modelname is informative as it's redundant otherwise
             if modelname != "Model":
-                axes[1].set_ylabel(modelname)
+                (axes[1].set_title if flipplot else axes[1].set_ylabel)(modelname)
+            if modeldesc is not None:
+                (axes[2].set_title if flipplot else axes[2].set_ylabel)(modeldesc)
             # The (logged) difference map
             chilog = np.log10(np.clip(np.abs(chi), minimg, np.inf)/minimg)*np.sign(chi)
             chilog /= np.log10(maximg/minimg)
@@ -413,19 +416,22 @@ class Model:
             # axes[4].hist(chi[~np.isnan(chi)], bins=100, log=True, density=True, histtype="step", fill=False)
             x = np.linspace(-5., 5., int(1e4) + 1, endpoint=True)
             axes[4].plot(x, spstats.norm.pdf(x))
-            axes[4].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
+            axes[3].set_title(r'$\chi^{2}_{\nu}$' + '={:.3f}'.format(chisqred))
             axes[4].yaxis.tick_right()
-            for i in range(1, 5):
-                if i != 4:
-                    axes[i].set_yticklabels([])
-                axes[i].yaxis.set_label_position("right")
-                if not isbottomrow:
-                    axes[i].set_xticklabels([])
+            if flipplot:
+                # TODO: What to do here?
+                pass
+            else:
+                for i in range(1, 5):
+                    if i != 4:
+                        axes[i].set_yticklabels([])
+                    axes[i].yaxis.set_label_position("right")
+                    if not isbottomrow:
+                        axes[i].set_xticklabels([])
             if istoprow:
-                axes[0].set_title("Data")
-                axes[1].set_title("Model")
-                axes[2].set_title("Residual")
-                axes[3].set_title("Residual/sigma")
+                labels = ["Data", "Model", "Residual", "Residual/\sigma"]
+                for axis, label in enumerate(labels):
+                    (axes[axis].set_ylabel if flipplot else axes[axis].set_title)(label)
         else:
             chilog = None
             chiclip = None
@@ -665,6 +671,7 @@ class Model:
                     except Exception as e:
                         raise e
                 except Exception as e:
+                    print("Exception attempting to draw image from profiles:", profilesgs)
                     raise e
                 # TODO: Determine why this is necessary. Should we keep an imageD per exposure?
                 if drawimage:
@@ -1626,6 +1633,7 @@ class MultiGaussianApproximationProfile(Component):
                 weights, sigmas = MultiGaussianApproximationProfile.weights[self.profile][self.order][slope]
                 sigmas = np.sqrt(sigmas)
             else:
+                slope = np.log10(slope)
                 weights = np.array([f(slope) for f in self.weightsplines])
                 sigmas = np.array([f(slope) for f in self.sigmasplines])
             profiles = [{} for _ in range(self.order)]
@@ -1743,12 +1751,12 @@ class MultiGaussianApproximationProfile(Component):
         for index, (weights, variances) in weightvars.items():
             assert (len(weights) == order)
             assert (len(variances) == order)
-        indices = [x for x in weightvars.keys()]
+        indices = [np.log10(x) for x in weightvars.keys()]
         for i in range(order):
             self.weightsplines.append(spinterp.InterpolatedUnivariateSpline(
                 indices, [values[0][i] for values in weightvars.values()]))
             self.sigmasplines.append(spinterp.InterpolatedUnivariateSpline(
-                indices, [values[1][i] for values in weightvars.values()]))
+                indices, [np.sqrt(values[1][i]) for values in weightvars.values()]))
 
 
 
