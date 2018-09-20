@@ -23,6 +23,8 @@ transformsref = {
     "inverse": proobj.Transform(transform=functools.partial(np.divide, 1.),
                                 reverse=functools.partial(np.divide, 1.)),
     "logit": proobj.Transform(transform=special.logit, reverse=special.expit),
+    "logitaxrat": proobj.Transform(transform=functools.partial(logitlimited, lower=1e-4, extent=1-1e-4),
+                                    reverse=functools.partial(expitlimited, lower=1e-4, extent=1-1e-4)),
     "logitsersic": proobj.Transform(transform=functools.partial(logitlimited, lower=0.3, extent=5.7),
                                     reverse=functools.partial(expitlimited, lower=0.3, extent=5.7)),
     "logitmultigausssersic": proobj.Transform(
@@ -71,11 +73,13 @@ def absconservetotal(ndarray):
             sumneg += ndarray[indices[indexarr]]
             ndarray[indices[indexarr]] = 0
             indexarr += 1
-        while sumneg < 0:
+        while sumneg < 0 and indexarr < ndarray.shape[0]:
             sumneg += ndarray[indices[indexarr]]
             ndarray[indices[indexarr]] = 0
             indexarr += 1
         ndarray[indices[indexarr-1]] = sumneg
+        if indexarr == ndarray.shape[0]:
+            raise RuntimeError("absconservetotal failed for array with sum {}".format(np.sum(ndarray)))
     ndarray.shape = shape
     return ndarray
 
@@ -120,7 +124,7 @@ def getparamdefault(param, value=None, profile=None, fixed=False, isvaluetransfo
         elif profile == "sersic":
             name = "re"
     elif param == "axrat":
-        transform = transformsref["logit"]
+        transform = transformsref["logitaxrat"]
 
     if value is None:
         # TODO: Improve this (at least check limits)
@@ -251,20 +255,22 @@ def getchisqred(chis):
 
 def fitmodel(model, modeller=None, modellib="scipy", modellibopts={'algo': "Nelder-Mead"}, printfinal=True,
              printsteps=100, plot=False, modelname=None, figure=None, title=None, axes=None,
-             figurerow=None, modelnameappendparams=None):
+             figurerow=None, modelnameappendparams=None, flipplot=False):
     if modeller is None:
         modeller = proobj.Modeller(model=model, modellib=modellib, modellibopts=modellibopts)
     fit = modeller.fit(printfinal=printfinal, printsteps=printsteps)
     # Conveniently sets the parameters to the right values too
     if plot:
-        modeldesc = modelname
+        modeldesc = None
         if modelnameappendparams is not None:
+            modeldesc = ""
             for string, param in modelnameappendparams:
                 modeldesc += string.format(param.getvalue(transformed=False))
     else:
         modeldesc = None
-    _, _, chis, _ = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modeldesc, figure=figure,
-                                   axes=axes, figurerow=figurerow)
+    _, _, chis, _ = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modelname,
+                                   modeldesc=modeldesc, figure=figure, axes=axes, figurerow=figurerow,
+                                   flipplot=flipplot)
     if plot:
         if title is not None:
             plt.suptitle(title)
