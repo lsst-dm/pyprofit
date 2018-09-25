@@ -264,8 +264,21 @@ def fitmodel(model, modeller=None, modellib="scipy", modellibopts={'algo': "Neld
         modeldesc = None
         if modelnameappendparams is not None:
             modeldesc = ""
-            for string, param in modelnameappendparams:
-                modeldesc += string.format(param.getvalue(transformed=False))
+            modeldescs = {}
+            for formatstring, param in modelnameappendparams:
+                if '=' not in formatstring:
+                    paramname = param.name
+                    value = formatstring
+                else:
+                    paramname, value = formatstring.split('=')
+                if paramname not in modeldescs:
+                    modeldescs[paramname] = []
+                modeldescs[paramname].append(value.format(param.getvalue(transformed=False)))
+
+            for paramname, values in modeldescs.items():
+                modeldesc += paramname + ':' + ','.join(values) + ';'
+            # Remove the trailing colon
+            modeldesc = modeldesc[:-1]
     else:
         modeldesc = None
     _, _, chis, _ = model.evaluate(params=fit["paramsbest"], plot=plot, modelname=modelname,
@@ -277,8 +290,13 @@ def fitmodel(model, modeller=None, modellib="scipy", modellibopts={'algo': "Neld
         plt.show(block=False)
     fit["chisqred"] = getchisqred(chis)
     params = model.getparameters()
-    fit["paramsbestall"] = [param.getvalue(transformed=False) for param in params]
-    fit["paramsbestalltransformed"] = [param.getvalue(transformed=True) for param in params]
+    for item in ['paramsbestall', 'paramsbestalltransformed', 'paramsallfixed']:
+        fit[item] = []
+    for param in params:
+        fit["paramsbestall"].append(param.getvalue(transformed=False))
+        fit["paramsbestalltransformed"].append(param.getvalue(transformed=True))
+        fit["paramsallfixed"].append(param.fixed)
+
     return fit, modeller
 
 
