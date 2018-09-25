@@ -1031,6 +1031,8 @@ class PhotometricModel:
         :return: List of dicts by band
         '''
         # TODO: Check if this should skip entirely instead of adding a None for non-included bands
+        if bands is None:
+            bands = self.fluxes.keys()
         bandfluxes = {band: self.fluxes[band].getvalue(transformed=False) if
                       band in self.fluxes else None for band in bands}
         profiles = []
