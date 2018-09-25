@@ -62,6 +62,10 @@ def getellipseestimate(img, denoise=True):
     return axrat, ang, np.sqrt(evals[idxevalmax]/np.sum(flux))
 
 
+def isfluxratio(param):
+    return isinstance(param, proobj.FluxParameter) and param.isfluxratio
+
+
 def getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psfimage, sigmainverse=None, factorsigma=1):
     model = proutil.getmodel({band: 1}, psfmodel, np.flip(psfimage.shape, axis=0),
                              8.0 * 10 ** ((np.arange(numcomps) - numcomps / 2) / numcomps),
@@ -69,8 +73,7 @@ def getpsfmodel(engine, engineopts, numcomps, band, psfmodel, psfimage, sigmainv
                              np.linspace(start=0, stop=180, num=numcomps + 2)[1:(numcomps + 1)],
                              engine=engine, engineopts=engineopts)
     for param in model.getparameters(fixed=False):
-        if isinstance(param, proobj.FluxParameter) and not param.isfluxratio:
-            param.fixed = True
+        param.fixed = isfluxratio(param)
     proutil.setexposure(model, band, image=psfimage, sigmainverse=sigmainverse, factorsigma=factorsigma)
     return model
 
@@ -175,14 +178,14 @@ def initmodelfrommodelfits(model, modelfits):
                 paramset.setvalue(value, transformed=False)
 
 
-def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
-              modellib=None, modellibopts=None, plot=False, name=None
+def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None, modellib=None, modellibopts=None,
+              plot=False, name=None, models=None, fitsbyengine=None, redoall=True,
               ):
     """
 
     :param img: ndarray; 2D Image
     :param psfs: Collection of proutil.PSF object
-    :param sigmainverse: ndarray; 2D Inverse sigma image ndarray
+    :param sigmainverse: ndarray; 2D Inverse sigma image ndarr
     :param band: string; Filter/passband name
     :param mask: ndarray; 2D Inverse mask image (1=include, 0=omit)
     :param modelspecs: Model specifications as returned by getmodelspecs
@@ -212,12 +215,13 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
     }
     # TODO: validate specs
     specs = {name: idx for idx, name in enumerate(modelspecs[1])}
-    models = {}
+    models = {} if (models is None) or redoall else models
     paramsfixeddefault = {}
-    fitsbyengine = {}
+    fitsbyengine = {} if ((models is None) or (fitsbyengine is None) or redoall) else fitsbyengine
     usemodellibdefault = modellibopts is None
     for engine, engineopts in engines.items():
-        fitsbyengine[engine] = {}
+        if (engine not in fitsbyengine) or redoall:
+            fitsbyengine[engine] = {}
         fitsengine = fitsbyengine[engine]
         if plot:
             nrows = len(modelspecs[0])
@@ -237,141 +241,175 @@ def fitgalaxy(img, psfs, sigmainverse, band, modelspecs, mask=None,
         for modelidx, modelinfo in enumerate(modelspecs[0]):
             modelname = modelinfo[specs["name"]]
             modeltype = modelinfo[specs["model"]]
-            if modeltype not in models:
-                models[modeltype] = proutil.getmodel(
-                    {band: flux}, modeltype, npiximg, engine=engine, engineopts=engineopts
-                )
-                paramsfixeddefault[modeltype] = [param.fixed for param in
-                                                 models[modeltype].getparameters(fixed=True)]
-            model = models[modeltype]
+            modeldefault = proutil.getmodel(
+                {band: flux}, modeltype, npiximg, engine=engine, engineopts=engineopts
+            )
+            paramsfixeddefault[modeltype] = [param.fixed for param in
+                                             modeldefault.getparameters(fixed=True)]
+            model = modeldefault if (redoall or modeltype not in models) else models[modeltype]
             psfname = modelinfo[specs["psfmodel"]] + ("_pixelated" if proutil.str2bool(
                 modelinfo[specs["psfpixel"]]) else "")
             proutil.setexposure(model, band, image=img.array, sigmainverse=sigmainverse,
                                 psf=psfs[psfname]["object"], mask=mask)
-            inittype = modelinfo[specs["inittype"]]
-            if inittype == "moments":
-                for param in model.getparameters(fixed=False):
-                    if param.name in initfrommoments:
-                        param.setvalue(initfrommoments[param.name], transformed=False)
+            if not redoall and (modelname in fitsbyengine[engine]):
+                if plot:
+                    valuesbest = fitsengine[modelname]['fits'][-1]['paramsbestalltransformed']
+                    # TODO: consider how to avoid code repetition here and below
+                    modeldescs = {x: [] for x in ['f', 'n', 'r']}
+                    formats = {x: '{:.1f}' if x == 'r' else '{:.2f}' for x in ['f', 'n', 'r']}
+                    for param, value in zip(model.getparameters(fixed=True), valuesbest):
+                        param.setvalue(value, transformed=True)
+                        if param.name == "nser":
+                            modeldescs['n'].append(param)
+                        elif param.name == "re":
+                            modeldescs['r'].append(param)
+                        elif isfluxratio(param) and param.getvalue(transformed=False) < 1:
+                            modeldescs['f'].append(param)
+                    modeldescs = [paramname + '=' + ','.join(
+                        [formats[paramname] .format(param.getvalue(transformed=False)) for param in params])
+                        for paramname, params in modeldescs.items() if params]
+                    modeldescs = ';'.join(modeldescs)
+                    if title is not None:
+                        plt.suptitle(title)
+                    model.evaluate(plot=plot, modelname=modelname,
+                                   modeldesc=modeldescs if modeldescs else None, figure=figure, axes=axes,
+                                   figurerow=modelidx, flipplot=flipplot)
+                    plt.show(block=False)
             else:
-                # TODO: Refactor into function
-                if inittype.startswith("best"):
-                    if inittype == "best":
-                        modelnamecomps = []
-                        for modelidxcomp in range(modelidx):
-                            modelinfocomp = modelspecs[0][modelidxcomp]
-                            if modelinfocomp[specs["model"]] == modeltype:
-                                modelnamecomps.append(modelinfocomp[specs['name']])
-                    else:
-                        # TODO: Check this more thoroughly
-                        modelnamecomps = inittype.split(":")[1].split(";")
-                        print(modelnamecomps)
-                    chisqredbest = np.Inf
-                    for modelnamecomp in modelnamecomps:
-                        chisqred = fitsbyengine[engine][modelnamecomp]["fits"][-1]["chisqred"]
-                        if chisqred < chisqredbest:
-                            chisqredbest = chisqred
-                            inittype = modelnamecomp
+                inittype = modelinfo[specs["inittype"]]
+                if inittype == "moments":
+                    for param in model.getparameters(fixed=False):
+                        if param.name in initfrommoments:
+                            param.setvalue(initfrommoments[param.name], transformed=False)
                 else:
-                    inittype = inittype.split(';')
-                    if len(inittype) > 1:
-                        modelfits = [{
-                            'paramvals': fitsengine[initname]['fits'][-1]['paramsbestall'],
-                            'paramtree': models[fitsengine[initname]['modeltype']].getparameters(
-                                fixed=True, flatten=False),
-                            'params': models[fitsengine[initname]['modeltype']].getparameters(fixed=True),
-                            'chisqred': fitsengine[initname]['fits'][-1]['chisqred'],
-                            'modeltype': fitsengine[initname]['modeltype']}
-                            for initname in inittype
-                        ]
-                        initmodelfrommodelfits(model, modelfits)
-                        inittype = None
+                    # TODO: Refactor into function
+                    if inittype.startswith("best"):
+                        if inittype == "best":
+                            modelnamecomps = []
+                            for modelidxcomp in range(modelidx):
+                                modelinfocomp = modelspecs[0][modelidxcomp]
+                                if modelinfocomp[specs["model"]] == modeltype:
+                                    modelnamecomps.append(modelinfocomp[specs['name']])
+                        else:
+                            # TODO: Check this more thoroughly
+                            modelnamecomps = inittype.split(":")[1].split(";")
+                            print(modelnamecomps)
+                        chisqredbest = np.Inf
+                        for modelnamecomp in modelnamecomps:
+                            chisqred = fitsbyengine[engine][modelnamecomp]["fits"][-1]["chisqred"]
+                            if chisqred < chisqredbest:
+                                chisqredbest = chisqred
+                                inittype = modelnamecomp
                     else:
-                        inittype = inittype[0]
-                        if inittype not in fitsbyengine[engine]:
-                            # TODO: Fail or fall back here?
-                            raise RuntimeError("Model {} can't find reference {} to initialize from".format(
-                                modelname, inittype
-                            ))
-                if inittype:
-                    paramvalsinit = fitsbyengine[engine][inittype]["fits"][-1]["paramsbestall"]
-                    for param, value in zip(model.getparameters(fixed=True), paramvalsinit):
-                        param.setvalue(value, transformed=False)
-            # Reset parameter fixed status
-            for param, fixed in zip(model.getparameters(fixed=True), paramsfixeddefault[modeltype]):
-                param.fixed = fixed
-            # Parse default overrides from model spec
-            paramflags = {}
-            for flag in ["fixedparams", "initparams"]:
-                paramflags[flag] = {}
-                values = modelinfo[specs[flag]]
-                if values:
-                    for flagvalue in values.split(";"):
-                        if flag == "fixedparams":
-                            paramflags[flag][flagvalue] = None
-                        elif flag == "initparams":
-                            value = flagvalue.split("=")
-                            # TODO: sort this out
-                            valuesplit = [np.float(x) for x in value[1].split(',')]
-                            paramflags[flag][value[0]] = valuesplit
-            # For printing parameter values when plotting
-            modelnameappendparams = []
-            # Now actually apply the overrides and the hardcoded maxima
-            timesmatched = {}
-            for param in model.getparameters(fixed=True):
-                if param.name in paramflags["fixedparams"]:
-                    param.fixed = True
-                if param.name in paramflags["initparams"]:
-                    if param.name not in timesmatched:
-                        timesmatched[param.name] = 0
-                    param.setvalue(paramflags["initparams"][param.name][timesmatched[param.name]],
-                                   transformed=False)
-                    timesmatched[param.name] += 1
-                isfluxrat = isinstance(param, proobj.FluxParameter) and param.isfluxratio
-                if plot and not param.fixed:
-                    if param.name == "nser":
-                        modelnameappendparams += [(",n={:.2f}", param)]
-                    elif isfluxrat:
-                        modelnameappendparams += [(",f={:.2f}", param)]
-                if param.name in valuesmax and not isfluxrat:
-                    transform = param.transform.transform
-                    param.limits = proobj.Limits(lower=transform(0), upper=transform(valuesmax[param.name]),
-                                                 transformed=True)
+                        inittype = inittype.split(';')
+                        if len(inittype) > 1:
+                            modelfits = [{
+                                'paramvals': fitsengine[initname]['fits'][-1]['paramsbestall'],
+                                'paramtree': models[fitsengine[initname]['modeltype']].getparameters(
+                                    fixed=True, flatten=False),
+                                'params': models[fitsengine[initname]['modeltype']].getparameters(fixed=True),
+                                'chisqred': fitsengine[initname]['fits'][-1]['chisqred'],
+                                'modeltype': fitsengine[initname]['modeltype']}
+                                for initname in inittype
+                            ]
+                            initmodelfrommodelfits(model, modelfits)
+                            inittype = None
+                        else:
+                            inittype = inittype[0]
+                            if inittype not in fitsbyengine[engine]:
+                                # TODO: Fail or fall back here?
+                                raise RuntimeError("Model {} can't find reference {} "
+                                    "to initialize from".format(modelname, inittype))
+                    if inittype:
+                        paramvalsinit = fitsbyengine[engine][inittype]["fits"][-1]["paramsbestall"]
+                        for param, value in zip(model.getparameters(fixed=True), paramvalsinit):
+                            param.setvalue(value, transformed=False)
 
-            print("Fitting model {:s} of type {:s} using engine {:s}".format(modelname, modeltype, engine))
-            sys.stdout.flush()
-            try:
-                fits = []
-                dosecond = (len(model.sources[0].modelphotometric.components) > 1) or not usemodellibdefault
-                if usemodellibdefault:
-                    modellibopts = {
-                        "algo": ("cobyla" if modellib == "pygmo" else "COBYLA") if dosecond else
-                        ("neldermead" if modellib == "pygmo" else "Nelder-Mead")
-                    }
-                    if modellib == "scipy":
-                        modellibopts['options'] = {'maxfun': 1e4}
-                fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts,
-                                                  printfinal=True, printsteps=100, plot=plot and not dosecond,
-                                                  figure=figure, axes=axes, figurerow=modelidx,
-                                                  flipplot=flipplot, modelname=modelname,
-                                                  modelnameappendparams=modelnameappendparams
-                                                  )
-                fits.append(fit1)
-                if dosecond:
+                # Reset parameter fixed status
+                for param, fixed in zip(model.getparameters(fixed=True), paramsfixeddefault[modeltype]):
+                    param.fixed = fixed
+                # Parse default overrides from model spec
+                paramflags = {}
+                for flag in ["fixedparams", "initparams"]:
+                    paramflags[flag] = {}
+                    values = modelinfo[specs[flag]]
+                    if values:
+                        for flagvalue in values.split(";"):
+                            if flag == "fixedparams":
+                                paramflags[flag][flagvalue] = None
+                            elif flag == "initparams":
+                                value = flagvalue.split("=")
+                                # TODO: sort this out
+                                valuesplit = [np.float(x) for x in value[1].split(',')]
+                                paramflags[flag][value[0]] = valuesplit
+                # For printing parameter values when plotting
+                modelnameappendparams = []
+                # Now actually apply the overrides and the hardcoded maxima
+                timesmatched = {}
+                for param in model.getparameters(fixed=True):
+                    if param.name in paramflags["fixedparams"]:
+                        param.fixed = True
+                    if param.name in paramflags["initparams"]:
+                        if param.name not in timesmatched:
+                            timesmatched[param.name] = 0
+                        param.setvalue(paramflags["initparams"][param.name][timesmatched[param.name]],
+                                       transformed=False)
+                        timesmatched[param.name] += 1
+                    isfluxrat = isfluxratio(param)
+                    if plot and not param.fixed:
+                        if param.name == "nser":
+                            modelnameappendparams += [("n={:.2f}", param)]
+                        elif isfluxrat:
+                            modelnameappendparams += [("f={:.2f}", param)]
+                    if param.name in valuesmax and not isfluxrat:
+                        transform = param.transform.transform
+                        param.limits = proobj.Limits(lower=transform(0), upper=transform(valuesmax[param.name]),
+                                                     transformed=True)
+                    # Reset non-finite free param values
+                    # This occurs e.g. at the limits of a logit transformed param
+                    if not param.fixed:
+                        paramval = param.getvalue(transformed=True)
+                        if not np.isfinite(paramval):
+                            param.setvalue(
+                                np.nextafter(param.getvalue(transformed=False),(-1) ** (paramval < 0)),
+                                transformed=False)
+
+                print("Fitting model {:s} of type {:s} using engine {:s}".format(modelname, modeltype, engine))
+                sys.stdout.flush()
+                try:
+                    fits = []
+                    dosecond = (len(model.sources[0].modelphotometric.components) > 1) or not usemodellibdefault
                     if usemodellibdefault:
-                        modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else "Nelder-Mead"
-                    fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
-                                               plot=plot, figure=figure, axes=axes, figurerow=modelidx,
-                                               flipplot=flipplot, modelname=modelname,
-                                               modelnameappendparams=modelnameappendparams)
-                    fits.append(fit2)
-                fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
-            except Exception as e:
-                print("Error fitting id={}:".format(idnum))
-                print(e)
-                trace = traceback.format_exc()
-                print(trace)
-                fitsbyengine[engine][modelname] = e, trace
+                        modellibopts = {
+                            "algo": ("cobyla" if modellib == "pygmo" else "COBYLA") if dosecond else
+                            ("neldermead" if modellib == "pygmo" else "Nelder-Mead")
+                        }
+                        if modellib == "scipy":
+                            modellibopts['options'] = {'maxfun': 1e4}
+                    fit1, modeller = proutil.fitmodel(model, modellib=modellib, modellibopts=modellibopts,
+                                                      printfinal=True, printsteps=100,
+                                                      plot=plot and not dosecond,
+                                                      figure=figure, axes=axes, figurerow=modelidx,
+                                                      flipplot=flipplot, modelname=modelname,
+                                                      modelnameappendparams=modelnameappendparams
+                                                      )
+                    fits.append(fit1)
+                    if dosecond:
+                        if usemodellibdefault:
+                            modeller.modellibopts["algo"] = "neldermead" if modellib == "pygmo" else \
+                                "Nelder-Mead"
+                        fit2, _ = proutil.fitmodel(model, modeller, printfinal=True, printsteps=100,
+                                                   plot=plot, figure=figure, axes=axes, figurerow=modelidx,
+                                                   flipplot=flipplot, modelname=modelname,
+                                                   modelnameappendparams=modelnameappendparams)
+                        fits.append(fit2)
+                    fitsbyengine[engine][modelname] = {"fits": fits, "modeltype": modeltype}
+                except Exception as e:
+                    print("Error fitting id={}:".format(idnum))
+                    print(e)
+                    trace = traceback.format_exc()
+                    print(trace)
+                    fitsbyengine[engine][modelname] = e, trace
     if plot:
         plt.show(block=False)
         plt.tight_layout()
@@ -519,6 +557,7 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                     radec[0], radec[1], imghst, imgpsfgs, sizeCutout, cutouthsc[0], var, scalehsc, plot=plot
                 )
                 fluxscale = (10 ** result.x[0])
+                metadata["lenhst2hsc"] = scalehst/scalehsc
                 metadata["fluxscalehst2hsc"] = fluxscale
                 metadata["anglehst2hsc"] = anglehst
                 metadata["offsetxhst2hsc"] = offsetxhst
@@ -531,6 +570,14 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                     # TODO: Fix this as it's not working by default
                     img = imgoffsetchisq(result.x, returnimg=True, imgref=cutouthsc[0],
                                          psf=imgpsfgs, nx=sizeCutout, ny=sizeCutout, scale=scalehsc)
+                    img = gs.Convolve(img, imgpsfgs).drawImage(nx=sizeCutout, ny=sizeCutout,
+                                                               scale=scalehsc) * fluxscale
+                    # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image/model
+                    psf = gs.Convolve(imgpsfgs, psfhst.rotate(anglehst * gs.degrees)).drawImage(
+                        nx=imgpsf.shape[1], ny=imgpsf.shape[0], scale=scalehscpsf
+                    )
+                    psf /= np.sum(psf.array)
+                    psf = gs.InterpolatedImage(psf)
                 else:
                     fits = results['hst']['fits']['galsim']
                     if hst2hscmodel == 'best':
@@ -570,6 +617,7 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                     modeltouse.evaluate(keepmodels=True, getlikelihood=False, drawimage=False)
                     img = gs.Convolve(exposuremodel.meta['model'], imgpsfgs).drawImage(
                         nx=sizeCutout, ny=sizeCutout, scale=scalehsc) * fluxscale
+                    psf = imgpsfgs
 
                 noisetoadd = np.random.normal(scale=np.sqrt(var))
                 img += noisetoadd
@@ -592,14 +640,6 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                         ax2[0, 1 + imgidx].imshow(np.log10(imgit))
                         ax2[0, 1 + imgidx].set_title((descpre + " + noise").format(
                             bandhst, desc))
-
-                sigmainverse = 1.0 / np.sqrt(var)
-                # The PSF is now HSTPSF*HSCPSF, and "truth" is the deconvolved HST image/model
-                psf = gs.Convolve(imgpsfgs, psfhst.rotate(anglehst * gs.degrees)).drawImage(
-                    nx=imgpsf.shape[1], ny=imgpsf.shape[0], scale=scalehscpsf
-                )
-                psf /= np.sum(psf.array)
-                psf = gs.InterpolatedImage(psf)
             else:
                 # TODO: Fix this if desired
                 mask = exposure.getMaskedImage().getMask()
@@ -628,20 +668,27 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
         }
         fitname = "COSMOS #{}".format(idcosmosgs)
         for psfmodelname, ispsfpixelated in psfmodels:
+            psfname = psfmodelname + ("_pixelated" if ispsfpixelated else "")
             if psfmodelname == "empirical":
                 psfmodel = psf
                 psfexposure = proobj.PSF(band=band, engine="galsim", image=psf.image.array)
             else:
                 engineopts["drawmethod"] = "no_pixel" if ispsfpixelated else None
-                psfmodel = fitpsf(psf.image.array, psfmodelname, {"galsim": engineopts}, band=band, plot=plot,
-                                  modelname=psfmodelname, title=fitname)["galsim"]
-                psfexposure = proobj.PSF(band=band, engine="galsim", model=psfmodel["model"].sources[0],
-                                         modelpixelated=ispsfpixelated)
-            psfname = psfmodelname + ("_pixelated" if ispsfpixelated else "")
+                if redo or psfname not in results[srcname]['psfs']:
+                    psfmodel = fitpsf(psf.image.array, psfmodelname, {"galsim": engineopts}, band=band,
+                                      plot=plot, modelname=psfmodelname, title=fitname)["galsim"]
+                    psfexposure = proobj.PSF(band=band, engine="galsim", model=psfmodel["model"].sources[0],
+                                             modelpixelated=ispsfpixelated)
+                else:
+                    psfmodel = results[srcname]['psfs'][psfname]['model']
+                    psfexposure = results[srcname]['psfs'][psfname]['object']
             psfs[psfname] = {"model": psfmodel, "object": psfexposure}
+        fitsbyengine = None if redo else results[srcname]['fits']
+        models = None if redo else results[srcname]['models']
         fits, models = fitgalaxy(
             img=img, psfs=psfs, sigmainverse=sigmainverse, mask=mask, band=band, modelspecs=modelspecs,
-            name=fitname, modellib=modellib, plot=plot)
+            name=fitname, modellib=modellib, plot=plot, models=models, fitsbyengine=fitsbyengine,
+            redoall=redo)
         if resetimages:
             for psfmodelname, psf in psfs.items():
                 if "model" in psf:
@@ -656,6 +703,7 @@ def fitcosmosgalaxy(idcosmosgs, srcs, modelspecs, results={}, plot=False, redo=T
                             # Don't try to pickle pygmo problems for some reason I forget
                             if hasattr(fit["result"], "problem"):
                                 fit["result"]["problem"] = None
+        if not redo:
             results[srcname] = {'fits': fits, 'models': models, 'psfs': psfs, 'metadata': metadata}
 
     return results
@@ -685,6 +733,7 @@ if __name__ == '__main__':
 #        'engines':    {'type': str,   'nargs': '*', 'default': 'galsim', 'help': 'Model generation engines'},
         'plot':        {'type': proutil.str2bool, 'default': False, 'help': 'Toggle plotting of final fits'},
 #        'seed':       {'type': int,   'nargs': '?', 'default': 1, 'help': 'Numpy random seed'}
+        'redo':        {'type': proutil.str2bool, 'default': True, 'help': 'Redo existing fits'},
     }
 
     for key, value in flags.items():
@@ -751,9 +800,10 @@ if __name__ == '__main__':
         for idnum in range(idrange[0], idrange[0 + (len(idrange) > 1)] + (len(idrange) == 1)):
             print("Fitting COSMOS galaxy with ID: {}".format(idnum))
             try:
-                fits = fitcosmosgalaxy(idnum, srcs=srcs, modelspecs=modelspecs, plot=args.plot, redo=True,
-                                       resetimages=True, resetfitlogs=True, hst2hscmodel=args.hst2hscmodel,
-                                       results=data[idnum] if idnum in data else None, modellib=args.modellib)
+                fits = fitcosmosgalaxy(idnum, srcs=srcs, modelspecs=modelspecs, plot=args.plot,
+                                       redo=args.redo, resetimages=True, resetfitlogs=True,
+                                       hst2hscmodel=args.hst2hscmodel, modellib=args.modellib,
+                                       results=data[idnum] if idnum in data else None)
                 data[idnum] = fits
             except Exception as e:
                 print("Error fitting id={}:".format(idnum))
@@ -771,5 +821,4 @@ if __name__ == '__main__':
         with open(os.path.expanduser(args.fileout), 'wb') as f:
             pickle.dump(data, f)
     if args.plot:
-        plt.show(block=False)
         input("Press Enter to finish")
