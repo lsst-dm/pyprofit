@@ -10,6 +10,8 @@ pyprofit
 .. todo image:: https://img.shields.io/pypi/pyversions/pyprofit.svg
 .. todo   :target: https://pypi.python.org/pypi/pyprofit
 
+This version of *pyprofit* is deprecated. All new development is happening in `MultiProFit <https://github.com/lsst-dm/multiprofit>`_.
+
 *pyprofit* is an astronomical source modelling code, with python wrappers for functions from
 `libprofit <https://www.github.com/ICRAR/libprofit>`_.
 As such, you need to have *libprofit* installed in your system to install
