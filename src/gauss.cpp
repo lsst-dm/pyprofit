@@ -3,8 +3,8 @@
 
 #include <Python.h>
 
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
+//#include <pybind11/pybind11.h>
+//#include <pybind11/numpy.h>
 
 #include <iostream>
 #include <memory>
@@ -21,7 +21,7 @@
 
 using namespace profit;
 
-namespace py = pybind11;
+//namespace py = pybind11;
 
 /*
   Note: This causes build errors on Solaris due to "ambiguous and overloaded" pow calls.

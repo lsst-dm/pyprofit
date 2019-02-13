@@ -323,7 +323,7 @@ void _read_profiles(Model &model, PyObject *profiles_dict, const char *name, voi
 			auto p = model.add_profile(name);
 			read_bool(p, item, "convolve");
 			item_to_profile(p, item);
-		} catch(`alid_parameter &e) {
+		} catch(invalid_parameter &e) {
 			std::ostringstream os;
 			os << "warning: failed to create profile " << name << ": " << e.what();
 			PySys_WriteStderr("%s\n", os.str().c_str());

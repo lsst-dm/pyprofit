@@ -288,6 +288,12 @@ def like_model(params, data):
         print(params*data.sigmas[data.tofit])
         print(lp, ll, priorsum)
         print({name: val for name, val in zip(data.names, allparams)})
+    if hasattr(data, "printsteps") and data.printsteps is not None:
+        if hasattr(data, "stepnum"):
+            if data.stepnum % data.printsteps == 0:
+                print(data.stepnum, lp, ll, priorsum)
+                print(params)
+            data.stepnum += 1
     return lp
 
 
@@ -468,7 +474,7 @@ def prior_func(s):
     return norm_with_fixed_sigma
 
 
-def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printfinal=None):
+def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printfinal=None, printsteps=None):
     if printfinal is None:
         printfinal = True
     if init is None:
@@ -476,6 +482,9 @@ def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printf
 
     print(init)
     print(like_model(init, data))
+
+    data.printsteps = printsteps
+    data.stepnum = 0
 
     if optlib == "scipy":
         def neg_like_model(params, pdata):
@@ -520,7 +529,7 @@ def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printf
         if algonlopt:
             algo.extract(pg.nlopt).ftol_abs = 1e-3
 
-        algo.set_verbosity(1)
+        algo.set_verbosity(0)
 
         if grad:
             prob = pg.problem(profit_udp_grad())
@@ -549,7 +558,11 @@ def fit_data(data, init=None, optlib="scipy", algo="L-BFGS-B", grad=True, printf
 
     if printfinal:
         print("Elapsed time: {:.1f}".format(timerun))
-        print("Final likelihood: {:.2f}".format(like_model(paramsbest, data)))
+        verbosity = data.verbose
+        data.verbose = True
+        print("Final likelihood:")
+        like_model(paramsbest, data)
+        data.verbose = verbosity
         print("Parameter names: " + ",".join(["{:10s}".format(i) for i in data.names[data.tofit]]))
         print("Scaled parameters: " + ",".join(["{:.4e}".format(i) for i in paramsbest]))
         # TODO: These should be methods in the data object
